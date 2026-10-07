@@ -1,0 +1,15 @@
+vault:
+  server:
+    dev:
+      enabled: true
+      devRootToken: root
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+  injector:
+    enabled: true
+  ui:
+    enabled: true
