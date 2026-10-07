@@ -1,14 +1,25 @@
 vault:
   server:
     dev:
+      enabled: false
+    ha:
       enabled: true
-      devRootToken: root
+      replicas: 1
+      raft:
+        enabled: true
+        setNodeId: true
+      disruptionBudget:
+        enabled: false
+    dataStorage:
+      enabled: true
+      size: 2Gi
+      storageClass: local-path
     resources:
       requests:
         cpu: 50m
         memory: 128Mi
       limits:
-        memory: 256Mi
+        memory: 512Mi
   injector:
     enabled: true
   ui:
