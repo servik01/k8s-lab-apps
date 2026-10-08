@@ -1,0 +1,77 @@
+kube-prometheus-stack:
+  alertmanager:
+    enabled: false
+
+  grafana:
+    admin:
+      existingSecret: grafana-admin
+      userKey: admin-user
+      passwordKey: admin-password
+    persistence:
+      enabled: true
+      storageClassName: local-path
+      size: 1Gi
+    ingress:
+      enabled: true
+      ingressClassName: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: selfsigned-issuer
+      hosts:
+        - grafana.lab.local
+      tls:
+        - secretName: grafana-tls
+          hosts:
+            - grafana.lab.local
+
+  prometheus:
+    ingress:
+      enabled: true
+      ingressClassName: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: selfsigned-issuer
+      hosts:
+        - prometheus.lab.local
+      tls:
+        - secretName: prometheus-tls
+          hosts:
+            - prometheus.lab.local
+    prometheusSpec:
+      retention: 7d
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      resources:
+        requests:
+          cpu: 100m
+          memory: 400Mi
+        limits:
+          memory: 1Gi
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: local-path
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 5Gi
+
+  prometheusOperator:
+    admissionWebhooks:
+      certManager:
+        enabled: true
+      patch:
+        enabled: false
+
+  # kubeadm привязывает эти компоненты к 127.0.0.1, снаружи они не скрейпятся
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeEtcd:
+    enabled: false
+  kubeProxy:
+    enabled: false
+
+  # самоподписанный сертификат kubelet (как и в случае metrics-server)
+  kubelet:
+    serviceMonitor:
+      insecureSkipVerify: true
