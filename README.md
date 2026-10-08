@@ -30,6 +30,8 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.18` (прописа�
 | GitOps           | ArgoCD + ApplicationSet (репозиторий `k8s-lab-apps`) |
 | Хранилище        | local-path-provisioner v0.0.37 (default StorageClass `local-path`) |
 | Секреты          | Vault (чарт 0.34.0, Vault 2.0.3), Raft на PVC, 1 реплика, ручной unseal |
+| Мониторинг       | kube-prometheus-stack 91.9.0 (Prometheus, Grafana; Alertmanager выключен), данные на PVC |
+| Сеть, наблюдаемость | Hubble (relay + UI), метрики Cilium в Prometheus |
 | Тестовые приложения | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch образы под arm64) |
 
 ## Подготовка ОС (все ноды)
@@ -227,6 +229,7 @@ k8s-lab-apps/
 │   └── applicationset.yaml   # применяется вручную один раз
 └── workloads/                # каждая папка = одно приложение
     ├── local-path-storage/   # провижионер + kustomize-патч default class
+    ├── monitoring/           # wrapper-чарт kube-prometheus-stack
     ├── vault/                # wrapper-чарт Vault (Raft)
     ├── vault-demo/           # приложение с Vault Agent Injector
     ├── rbac-demo/            # ServiceAccount, Role, ClusterRole
@@ -278,6 +281,7 @@ spec:
         syncOptions:
           - CreateNamespace=true
           - RespectIgnoreDifferences=true
+          - ServerSideApply=true      # большие CRD (kube-prometheus-stack)
 ```
 
 Применить один раз вручную:
@@ -399,9 +403,92 @@ kubectl get nodes
 kubectl get pods -A | grep -v ' Running '
 ```
 
+## Мониторинг (kube-prometheus-stack)
+
+Приложение `workloads/monitoring`: wrapper-чарт (`Chart.yaml` с зависимостью `kube-prometheus-stack` 91.9.0 из `https://prometheus-community.github.io/helm-charts`, значения в `values.yaml` под ключом `kube-prometheus-stack:`).
+
+**Перед первым sync** руками создаются namespace и пароль Grafana. Пароль не генерируется чартом: Helm при каждом рендере в Argo создавал бы новый случайный, и Secret вечно расходился бы с Git; в values пароль не кладём, репозиторий публичный.
+
+```bash
+kubectl create namespace monitoring
+kubectl -n monitoring create secret generic grafana-admin \
+  --from-literal=admin-user=admin \
+  --from-literal=admin-password="$(openssl rand -base64 18)"
+
+# прочитать пароль:
+kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+В шаблон ApplicationSet добавлена опция `ServerSideApply=true`: CRD этого чарта слишком велики для обычного `kubectl apply` (лимит на аннотацию `last-applied-configuration`).
+
+Ключевые значения `values.yaml`:
+
+- Alertmanager выключен (экономия памяти, уведомления в лабе не нужны).
+- Grafana и Prometheus за ingress-nginx с TLS от `selfsigned-issuer` (`grafana.lab.local`, `prometheus.lab.local`).
+- Хранилище на `local-path`: Grafana 1Gi, Prometheus 5Gi, retention 7 дней.
+- `serviceMonitorSelectorNilUsesHelmValues: false` и `podMonitorSelectorNilUsesHelmValues: false`: Prometheus подхватывает ServiceMonitor и PodMonitor любых приложений, а не только с меткой этого релиза.
+- Сертификаты webhook'а оператора выпускает cert-manager (`admissionWebhooks.certManager.enabled`, джобы выключены): так нет hook-джоб и дрейфа `caBundle` в Argo.
+- Мониторы `kubeControllerManager`, `kubeScheduler`, `kubeEtcd`, `kubeProxy` выключены (kubeadm привязывает эти компоненты к 127.0.0.1).
+- `kubelet.serviceMonitor.insecureSkipVerify: true`: самоподписанный сертификат kubelet, как и в случае metrics-server.
+
+Доступ: на Mac в `/etc/hosts` добавить `192.168.64.18 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
+
+Полезный запрос в Prometheus: `sum by (namespace) (container_memory_working_set_bytes{container!=""})`, потребление памяти по namespace.
+
+## Наблюдаемость сети (Hubble)
+
+Hubble и метрики Cilium включены командой `cilium upgrade`. Параметры хранятся только в Helm-релизе (в Git их нет), а `--reuse-values` сохраняет ранее заданные `k8sServiceHost` и `k8sServicePort`. Если Cilium придётся ставить заново, их нужно передать снова.
+
+```bash
+cilium upgrade --reuse-values \
+  --set hubble.enabled=true \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true \
+  --set hubble.ui.ingress.enabled=true \
+  --set hubble.ui.ingress.className=nginx \
+  --set 'hubble.ui.ingress.hosts[0]=hubble.lab.local' \
+  --set 'hubble.ui.ingress.tls[0].secretName=hubble-tls' \
+  --set 'hubble.ui.ingress.tls[0].hosts[0]=hubble.lab.local' \
+  --set 'hubble.ui.ingress.annotations.cert-manager\.io/cluster-issuer=selfsigned-issuer' \
+  --set prometheus.enabled=true \
+  --set prometheus.serviceMonitor.enabled=true \
+  --set operator.prometheus.enabled=true \
+  --set operator.prometheus.serviceMonitor.enabled=true \
+  --set 'hubble.metrics.enabled={dns,drop,tcp,flow,port-distribution,icmp}' \
+  --set hubble.metrics.serviceMonitor.enabled=true
+```
+
+UI: `https://hubble.lab.local:30971` (запись в `/etc/hosts` на Mac: `192.168.64.18 hubble.lab.local`), namespace выбирается слева сверху. Hubble показывает потоки по мере появления, поэтому в тихом namespace карта пуста. Демонстрация дропа NetworkPolicy: запустить под без метки `role=client` и обращаться из него к `web`, а для сравнения из `client`:
+
+```bash
+kubectl -n netpol-demo run intruder --image=busybox:1.37 --restart=Never -- sleep 3600
+kubectl -n netpol-demo exec intruder -- wget -qO- --timeout=2 http://web
+kubectl -n netpol-demo exec deploy/client -- wget -qO- --timeout=2 http://web
+kubectl -n netpol-demo delete pod intruder
+```
+
+В UI `client → web` идёт сплошной линией с вердиктом `forwarded`, а `intruder → web` красным пунктиром с вердиктом `dropped`. Узел `intruder` подписан именем namespace: Hubble берёт подпись из метки `app`, а у пода из `kubectl run` её нет.
+
+Метрики: в Prometheus появляются цели `cilium-agent` (порт 9962), `cilium-operator` (9963) и `hubble` (9965). Скрейп идёт по IP ноды, потому что агент работает в сети хоста. Дропы по политикам: `sum by (reason, protocol) (increase(hubble_drop_total[30m]))`.
+
+CLI (сборка под arm64, как и у Cilium CLI):
+
+```bash
+HUBBLE_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/hubble/main/stable.txt)
+curl -L --fail --remote-name-all \
+  https://github.com/cilium/hubble/releases/download/${HUBBLE_VERSION}/hubble-linux-arm64.tar.gz
+sudo tar xzvfC hubble-linux-arm64.tar.gz /usr/local/bin
+rm hubble-linux-arm64.tar.gz
+
+cilium hubble port-forward &
+hubble observe --namespace netpol-demo --verdict DROPPED --last 20
+```
+
 ## Известные моменты / TODO
 
 - **Vault**: настройка (auth, политики, роли) делается руками и в Git не лежит, после каждого перезапуска пода нужен ручный unseal. Следующие шаги: провайдер `vault` для Terraform/OpenTofu и auto-unseal (transit или облачный KMS).
+- **Cilium** управляется через CLI, его параметры (`k8sServiceHost`, Hubble, метрики) хранятся только в Helm-релизе в кластере. Кандидат на перенос под ArgoCD, тогда значения окажутся в Git.
+- **Метрики control-plane** (controller-manager, scheduler, etcd, kube-proxy) отключены: kubeadm привязывает их к 127.0.0.1. Упражнение: открыть метрики и включить мониторы обратно; часть control-plane алертов в Prometheus из-за этого может гореть.
 - **Worker-нода** ещё не добавлена — кластер single-node.
 - **Taint control-plane** снят ради возможности шедулить поды на единственной ноде — вернуть после добавления worker.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.
