@@ -22,7 +22,7 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.18` (прописа�
 |------------------|-----------------------------------------------------|
 | Kubernetes       | v1.33.13 (через kubeadm)                             |
 | Container runtime| containerd (SystemdCgroup=true)                      |
-| CNI              | Cilium v1.20.1, `kubeProxyReplacement=true`          |
+| CNI              | Cilium 1.20.1 под управлением ArgoCD (`platform/cilium/values.yaml`), `kubeProxyReplacement=true` |
 | kube-proxy       | удалён, его роль выполняет Cilium (см. раздел «Установка Cilium») |
 | Ingress          | ingress-nginx (NodePort: 80→32337, 443→30971)        |
 | TLS              | cert-manager + `ClusterIssuer/selfsigned-issuer`     |
@@ -136,12 +136,12 @@ rm cilium-linux-arm64.tar.gz
 
 cilium install \
   --set kubeProxyReplacement=true \
-  --set k8sServiceHost=192.168.64.18 \
+  --set k8sServiceHost=k8s-api.lab.local \
   --set k8sServicePort=6443
 cilium status --wait
 ```
 
-> **kube-proxy не нужен, но нужен прямой адрес API.** Параметры `k8sServiceHost`/`k8sServicePort` обязательны, если kube-proxy удалён: иначе после перезагрузки агент Cilium пытается дойти до API через ClusterIP `10.96.0.1`, а маршрутизацию этого адреса делает он же (см. Troubleshooting). Указывать нужно IP, а не имя: внутри пода `k8s-api.lab.local` не резолвится. Если Cilium уже установлен без них: `cilium upgrade --reuse-values --set k8sServiceHost=192.168.64.18 --set k8sServicePort=6443`.
+> **kube-proxy не нужен, но нужен прямой адрес API.** Параметры `k8sServiceHost`/`k8sServicePort` обязательны, если kube-proxy удалён: иначе после перезагрузки агент Cilium пытается дойти до API через ClusterIP `10.96.0.1`, а маршрутизацию этого адреса делает он же (см. Troubleshooting). Имя `k8s-api.lab.local` работает: агент и оператор запускаются в `hostNetwork` и используют `/etc/hosts` ноды, поэтому запись `192.168.64.18 k8s-api.lab.local` на ноде обязательна (Cilium CLI подставляет адрес API из kubeconfig сам). После установки Cilium переводится под управление ArgoCD (раздел «Cilium под управлением ArgoCD»), и `cilium upgrade` больше не используется.
 >
 > Архитектура ноды — **arm64** (UTM/Apple Virtualization на Apple Silicon), поэтому используется `cilium-linux-arm64`, а не `amd64`.
 
@@ -226,7 +226,10 @@ argocd account update-password
 ```
 k8s-lab-apps/
 ├── bootstrap/
-│   └── applicationset.yaml   # применяется вручную один раз
+│   ├── applicationset.yaml   # применяется вручную один раз
+│   └── cilium.yaml           # Application для Cilium, тоже вручную
+├── platform/
+│   └── cilium/values.yaml    # значения Helm-чарта Cilium
 └── workloads/                # каждая папка = одно приложение
     ├── local-path-storage/   # провижионер + kustomize-патч default class
     ├── monitoring/           # wrapper-чарт kube-prometheus-stack
@@ -437,25 +440,39 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 
 ## Наблюдаемость сети (Hubble)
 
-Hubble и метрики Cilium включены командой `cilium upgrade`. Параметры хранятся только в Helm-релизе (в Git их нет), а `--reuse-values` сохраняет ранее заданные `k8sServiceHost` и `k8sServicePort`. Если Cilium придётся ставить заново, их нужно передать снова.
+Hubble и метрики включены значениями в `platform/cilium/values.yaml` и применяются через Git и ArgoCD (раздел «Cilium под управлением ArgoCD»). Первоначально они включались командой `cilium upgrade` с теми же параметрами.
 
-```bash
-cilium upgrade --reuse-values \
-  --set hubble.enabled=true \
-  --set hubble.relay.enabled=true \
-  --set hubble.ui.enabled=true \
-  --set hubble.ui.ingress.enabled=true \
-  --set hubble.ui.ingress.className=nginx \
-  --set 'hubble.ui.ingress.hosts[0]=hubble.lab.local' \
-  --set 'hubble.ui.ingress.tls[0].secretName=hubble-tls' \
-  --set 'hubble.ui.ingress.tls[0].hosts[0]=hubble.lab.local' \
-  --set 'hubble.ui.ingress.annotations.cert-manager\.io/cluster-issuer=selfsigned-issuer' \
-  --set prometheus.enabled=true \
-  --set prometheus.serviceMonitor.enabled=true \
-  --set operator.prometheus.enabled=true \
-  --set operator.prometheus.serviceMonitor.enabled=true \
-  --set 'hubble.metrics.enabled={dns,drop,tcp,flow,port-distribution,icmp}' \
-  --set hubble.metrics.serviceMonitor.enabled=true
+```yaml
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+    ingress:
+      enabled: true
+      className: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: selfsigned-issuer
+      hosts:
+        - hubble.lab.local
+      tls:
+        - secretName: hubble-tls
+          hosts:
+            - hubble.lab.local
+  metrics:
+    enabled: [dns, drop, tcp, flow, port-distribution, icmp]
+    serviceMonitor:
+      enabled: true
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+operator:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
 ```
 
 UI: `https://hubble.lab.local:30971` (запись в `/etc/hosts` на Mac: `192.168.64.18 hubble.lab.local`), namespace выбирается слева сверху. Hubble показывает потоки по мере появления, поэтому в тихом namespace карта пуста. Демонстрация дропа NetworkPolicy: запустить под без метки `role=client` и обращаться из него к `web`, а для сравнения из `client`:
@@ -484,10 +501,38 @@ cilium hubble port-forward &
 hubble observe --namespace netpol-demo --verdict DROPPED --last 20
 ```
 
+## Cilium под управлением ArgoCD
+
+Раньше Cilium ставился и обновлялся через CLI, а его параметры хранились только в Helm-релизе в кластере. После того как на холодном старте это сломало кластер (см. Troubleshooting), параметры перенесены в Git.
+
+- `platform/cilium/values.yaml`: значения чарта, выгруженные из Helm-релиза (`k8sServiceHost: k8s-api.lab.local`, `kubeProxyReplacement`, Hubble, метрики).
+- `bootstrap/cilium.yaml`: Application с двумя источниками: чарт `cilium` версии 1.20.1 из `https://helm.cilium.io/` и этот репозиторий как `ref: values`. Применяется вручную. Папка `platform/` лежит вне `workloads/*`, поэтому ApplicationSet её не трогает.
+
+Особенности Application:
+
+- **Нет finalizer**: удаление Application не сносит CNI.
+- **`ignoreDifferences` для `/data`** у Secret'ов `cilium-ca`, `hubble-server-certs`, `hubble-relay-client-certs` (вместе с `RespectIgnoreDifferences=true`): чарт генерирует эти сертификаты при каждом рендере, и без правила Argo ротировал бы их при каждой синхронизации.
+- **`automated` с `selfHeal: true` и `prune: false`**: ручные правки откатываются к Git, но Argo ничего не удаляет сам.
+
+Выгрузка значений из релиза (Cilium CLI хранит его в Secret'е Helm, без установки `helm`; перед коммитом проверить вывод на секреты):
+
+```bash
+REL=$(kubectl -n kube-system get secret -l owner=helm,name=cilium,status=deployed \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
+  | base64 -d | base64 -d | gunzip | jq '.config'
+```
+
+Порядок миграции, который сработал без перезапуска подов: Application без `automated`, затем сравнение через `argocd app diff cilium --core` (единственное расхождение: аннотация `argocd.argoproj.io/tracking-id`), ручной `argocd app sync cilium --core` и сверка `startTime` подов до и после, и только потом включение `automated`. CLI `argocd` в режиме `--core` берёт Argo из kubeconfig, ему нужен namespace `argocd` в текущем контексте: `kubectl config set-context --current --namespace=argocd` (после диффа вернуть `default`). Сборка под arm64: `argocd-linux-arm64` со страницы релизов.
+
+**Правило**: все изменения Cilium делаются в `platform/cilium/values.yaml` и `git push`, `cilium upgrade` не используется. CLI остаётся для `cilium status` и диагностики. Значение `k8sServiceHost: k8s-api.lab.local` работает потому, что агент и оператор в `hostNetwork` резолвят имя через `/etc/hosts` ноды.
+
+Установка на чистый кластер: сначала Cilium ставится CLI (раздел «Установка Cilium»), затем `kubectl apply -f bootstrap/cilium.yaml`. Argo «усыновит» ресурсы, различие только в метках трекинга.
+
 ## Известные моменты / TODO
 
 - **Vault**: настройка (auth, политики, роли) делается руками и в Git не лежит, после каждого перезапуска пода нужен ручный unseal. Следующие шаги: провайдер `vault` для Terraform/OpenTofu и auto-unseal (transit или облачный KMS).
-- **Cilium** управляется через CLI, его параметры (`k8sServiceHost`, Hubble, метрики) хранятся только в Helm-релизе в кластере. Кандидат на перенос под ArgoCD, тогда значения окажутся в Git.
+- **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** (controller-manager, scheduler, etcd, kube-proxy) отключены: kubeadm привязывает их к 127.0.0.1. Упражнение: открыть метрики и включить мониторы обратно; часть control-plane алертов в Prometheus из-за этого может гореть.
 - **Worker-нода** ещё не добавлена — кластер single-node.
 - **Taint control-plane** снят ради возможности шедулить поды на единственной ноде — вернуть после добавления worker.
@@ -551,12 +596,7 @@ sudo sfdisk --part-type /dev/vda 4 0FC63DAF-8483-4772-8E79-3D69D8477DE4
 Ядро перечитает таблицу разделов только после перезагрузки (`Re-reading the partition table failed: Device or resource busy` здесь нормально). Откат типа раздела: GUID `0657FD6D-A4AB-43C4-84E5-0933C84B4F4F`.
 
 **После перезагрузки все поды в `Unknown`, `cilium-operator` в `CrashLoopBackOff` с `dial tcp 10.96.0.1:443: i/o timeout`**
-Cilium заменяет kube-proxy, а kube-proxy в кластере нет: агенту нужен API-сервер, но ClusterIP `10.96.0.1` маршрутизирует сам Cilium, который из-за этого не стартует. Замкнутый круг не виден, пока в памяти ядра живут старые BPF-программы, и проявляется на холодном старте. Лечение: дать Cilium прямой адрес API.
-```bash
-cilium upgrade --reuse-values \
-  --set k8sServiceHost=192.168.64.18 \
-  --set k8sServicePort=6443
-```
+Cilium заменяет kube-proxy, а kube-proxy в кластере нет: агенту нужен API-сервер, но ClusterIP `10.96.0.1` маршрутизирует сам Cilium, который из-за этого не стартует. Замкнутый круг не виден, пока в памяти ядра живут старые BPF-программы, и проявляется на холодном старте. Лечение: дать Cilium прямой адрес API, то есть `k8sServiceHost` и `k8sServicePort` в `platform/cilium/values.yaml`. Сейчас `cilium upgrade` использовать нельзя: `selfHeal` откатит правку к Git. Если кластер сломан настолько, что Argo не может синхронизироваться, временный выход это `cilium upgrade --reuse-values --set k8sServiceHost=k8s-api.lab.local --set k8sServicePort=6443`, после которого значения обязательно переносятся в Git.
 Признак в журнале kubelet: `deletion queue directory /var/run/cilium/deleteQueue has too many entries`. После запуска Cilium при необходимости: `sudo rm -f /var/run/cilium/deleteQueue/*` и `sudo systemctl restart kubelet`.
 
 **Новая папка в `workloads/` не превращается в Application**
