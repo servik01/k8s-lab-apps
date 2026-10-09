@@ -1,0 +1,45 @@
+cluster:
+  name: kubernetes
+
+# kube-proxy в кластере нет, Cilium берёт его роль.
+# Агент и оператор работают в hostNetwork, имя резолвится через /etc/hosts ноды.
+kubeProxyReplacement: true
+k8sServiceHost: k8s-api.lab.local
+k8sServicePort: 6443
+
+routingMode: tunnel
+tunnelProtocol: vxlan
+
+operator:
+  replicas: 1
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+hubble:
+  enabled: true
+  metrics:
+    enabled: [dns, drop, tcp, flow, port-distribution, icmp]
+    serviceMonitor:
+      enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+    ingress:
+      enabled: true
+      className: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: selfsigned-issuer
+      hosts:
+        - hubble.lab.local
+      tls:
+        - secretName: hubble-tls
+          hosts:
+            - hubble.lab.local
