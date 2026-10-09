@@ -20,4 +20,21 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: kube-system
+  # чарт генерирует сертификаты при каждом рендере: не даём Argo их ротировать
+  ignoreDifferences:
+    - kind: Secret
+      name: cilium-ca
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: hubble-server-certs
+      jsonPointers:
+        - /data
+    - kind: Secret
+      name: hubble-relay-client-certs
+      jsonPointers:
+        - /data
+  syncPolicy:
+    syncOptions:
+      - RespectIgnoreDifferences=true
   # automated sync пока не включаем: сначала смотрим расхождения
