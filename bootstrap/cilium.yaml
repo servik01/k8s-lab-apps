@@ -35,6 +35,8 @@ spec:
       jsonPointers:
         - /data
   syncPolicy:
+    automated:
+      selfHeal: true
+      prune: false      # CNI: ничего не удаляем автоматически
     syncOptions:
       - RespectIgnoreDifferences=true
-  # automated sync пока не включаем: сначала смотрим расхождения
