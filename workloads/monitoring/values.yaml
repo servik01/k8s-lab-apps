@@ -61,15 +61,21 @@ kube-prometheus-stack:
       patch:
         enabled: false
 
-  # kubeadm привязывает эти компоненты к 127.0.0.1, снаружи они не скрейпятся
+  # метрики control-plane открыты через extraArgs в kubeadm-config (platform/kubeadm/config.yaml)
   kubeControllerManager:
-    enabled: false
+    enabled: true
+    serviceMonitor:
+      https: true
+      insecureSkipVerify: true   # самоподписанный сертификат
   kubeScheduler:
-    enabled: false
+    enabled: true
+    serviceMonitor:
+      https: true
+      insecureSkipVerify: true
   kubeEtcd:
-    enabled: false
+    enabled: true                # HTTP на 2381, без аутентификации
   kubeProxy:
-    enabled: false
+    enabled: false               # kube-proxy нет, его роль у Cilium
 
   # самоподписанный сертификат kubelet (как и в случае metrics-server)
   kubelet:
