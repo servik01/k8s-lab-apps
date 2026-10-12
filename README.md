@@ -229,7 +229,8 @@ k8s-lab-apps/
 │   ├── applicationset.yaml   # применяется вручную один раз
 │   └── cilium.yaml           # Application для Cilium, тоже вручную
 ├── platform/
-│   └── cilium/values.yaml    # значения Helm-чарта Cilium
+│   ├── cilium/values.yaml    # значения Helm-чарта Cilium
+│   └── kubeadm/config.yaml   # ClusterConfiguration kubeadm (метрики control-plane)
 ├── iac/
 │   └── vault/                # OpenTofu: конфигурация Vault
 └── workloads/                # каждая папка = одно приложение
@@ -448,7 +449,7 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 - Хранилище на `local-path`: Grafana 1Gi, Prometheus 5Gi, retention 7 дней.
 - `serviceMonitorSelectorNilUsesHelmValues: false` и `podMonitorSelectorNilUsesHelmValues: false`: Prometheus подхватывает ServiceMonitor и PodMonitor любых приложений, а не только с меткой этого релиза.
 - Сертификаты webhook'а оператора выпускает cert-manager (`admissionWebhooks.certManager.enabled`, джобы выключены): так нет hook-джоб и дрейфа `caBundle` в Argo.
-- Мониторы `kubeControllerManager`, `kubeScheduler`, `kubeEtcd`, `kubeProxy` выключены (kubeadm привязывает эти компоненты к 127.0.0.1).
+- Мониторы control-plane включены: `kubeControllerManager` и `kubeScheduler` по HTTPS с `insecureSkipVerify` (самоподписанные сертификаты), `kubeEtcd` по HTTP на 2381. Метрики открыты правкой kubeadm-конфигурации (раздел «Конфигурация kubeadm»). `kubeProxy` выключен: kube-proxy в кластере нет.
 - `kubelet.serviceMonitor.insecureSkipVerify: true`: самоподписанный сертификат kubelet, как и в случае metrics-server.
 
 Доступ: на Mac в `/etc/hosts` добавить `192.168.64.18 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
@@ -546,11 +547,54 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 
 Установка на чистый кластер: сначала Cilium ставится CLI (раздел «Установка Cilium»), затем `kubectl apply -f bootstrap/cilium.yaml`. Argo «усыновит» ресурсы, различие только в метках трекинга.
 
+## Конфигурация kubeadm (метрики control-plane)
+
+По умолчанию kubeadm привязывает controller-manager (порт 10257), scheduler (10259) и метрики etcd (2381) к `127.0.0.1`, и Prometheus в кластере до них не достаёт. Параметры лежат в `platform/kubeadm/config.yaml` (`kubeadm.k8s.io/v1beta4`, где `extraArgs` это список пар `name`/`value`):
+
+- `controllerManager` и `scheduler`: `bind-address: 0.0.0.0`.
+- `etcd`: `listen-metrics-urls: http://127.0.0.1:2381,http://192.168.64.18:2381`. Loopback в списке стоит первым, чтобы пробы etcd остались на `127.0.0.1:2381`; метрики etcd идут по HTTP без аутентификации, поэтому слушаем только адрес ноды, а не все интерфейсы.
+- `InitConfiguration` закрепляет `advertiseAddress` и имя ноды, чтобы фаза `etcd` не пересчитала параметры существующего члена кластера.
+
+**Манифесты в `/etc/kubernetes/manifests` руками править нельзя**: следующий `kubeadm upgrade` перезапишет их из ConfigMap `kubeadm-config`. Поэтому правится конфигурация, манифесты регенерируются фазами kubeadm, а затем конфигурация загружается обратно в кластер.
+
+Перед правкой резервные копии, которые лежат в домашней директории вне репозитория (в них приватные ключи кластера):
+
+```bash
+kubectl -n kube-system exec etcd-kubernetes -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /var/lib/etcd/snapshot.db
+sudo cp /var/lib/etcd/snapshot.db ~/etcd-snapshot-$(date +%F).db
+sudo cp -a /etc/kubernetes ~/kubernetes-backup-$(date +%F)
+sudo chown -R $USER: ~/etcd-snapshot-* ~/kubernetes-backup-*
+```
+
+Регенерация по одному компоненту, от наименее рискованного. После каждой фазы сверка с резервной копией (`B` это каталог `~/kubernetes-backup-*`), kubelet пересоздаёт static pod сам в течение минуты:
+
+```bash
+B=$(ls -d ~/kubernetes-backup-* | tail -1)
+sudo kubeadm init phase control-plane scheduler --config platform/kubeadm/config.yaml
+sudo diff $B/manifests/kube-scheduler.yaml /etc/kubernetes/manifests/kube-scheduler.yaml
+sudo kubeadm init phase control-plane controller-manager --config platform/kubeadm/config.yaml
+sudo diff $B/manifests/kube-controller-manager.yaml /etc/kubernetes/manifests/kube-controller-manager.yaml
+sudo kubeadm init phase etcd local --config platform/kubeadm/config.yaml   # API ненадолго теряет хранилище
+sudo diff $B/manifests/etcd.yaml /etc/kubernetes/manifests/etcd.yaml
+sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.yaml
+```
+
+Допустимый дифф: смысловое изменение только одно (`--bind-address` или `--listen-metrics-urls`). Строка при этом «переезжает» (kubeadm сортирует аргументы), а у scheduler и controller-manager пропадают поля `host: 127.0.0.1` у проб: для `0.0.0.0` kubeadm убирает `host`, и пробы идут на адрес пода (в `hostNetwork` это IP ноды). Откатывать нужно, если изменились `--cluster-cidr`, `--service-cluster-ip-range`, `--initial-cluster`, `--listen-peer-urls`, `--advertise-client-urls`, `--name`, `--data-dir` или образ.
+
+Откат компонента: `sudo cp $B/manifests/<файл>.yaml /etc/kubernetes/manifests/`. Если кластер совсем не поднимается, в запасе снимок etcd.
+
+Проверка: `sudo ss -tlnp | grep -E ':10257|:10259|:2381'` (у первых двух `*`, у `:2381` два адреса), `curl -s http://192.168.64.18:2381/metrics | head -3`, `kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | grep -A3 extraArgs` (три блока), затем цели `kube-controller-manager`, `kube-scheduler`, `kube-etcd` в Prometheus в состоянии `up`.
+
 ## Известные моменты / TODO
 
 - **Vault**: после каждого перезапуска пода нужен ручный unseal (auto-unseal: transit или облачный KMS). Состояние OpenTofu лежит локально на VM: кандидат на удалённый backend. Для провайдера используется root token, лучше отдельный токен с узкой политикой.
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
-- **Метрики control-plane** (controller-manager, scheduler, etcd, kube-proxy) отключены: kubeadm привязывает их к 127.0.0.1. Упражнение: открыть метрики и включить мониторы обратно; часть control-plane алертов в Prometheus из-за этого может гореть.
+- **Метрики control-plane** открыты на адресе ноды: controller-manager и scheduler требуют токен с правом на `/metrics` (у Prometheus он есть), а метрики etcd идут по HTTP без аутентификации. Для лабы это приемлемо, на проде такие порты закрывают сетевыми политиками или файрволом.
 - **Worker-нода** ещё не добавлена — кластер single-node.
 - **Taint control-plane** снят ради возможности шедулить поды на единственной ноде — вернуть после добавления worker.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.
