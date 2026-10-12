@@ -29,7 +29,7 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.18` (прописа�
 | Metrics          | metrics-server (`--kubelet-insecure-tls`)            |
 | GitOps           | ArgoCD + ApplicationSet (репозиторий `k8s-lab-apps`) |
 | Хранилище        | local-path-provisioner v0.0.37 (default StorageClass `local-path`) |
-| Секреты          | Vault (чарт 0.34.0, Vault 2.0.3), Raft на PVC, 1 реплика, ручной unseal |
+| Секреты          | Vault (чарт 0.34.0, Vault 2.0.3), Raft на PVC, 1 реплика, ручной unseal; конфигурация в `iac/vault` (OpenTofu) |
 | Мониторинг       | kube-prometheus-stack 91.9.0 (Prometheus, Grafana; Alertmanager выключен), данные на PVC |
 | Сеть, наблюдаемость | Hubble (relay + UI), метрики Cilium в Prometheus |
 | Тестовые приложения | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch образы под arm64) |
@@ -230,6 +230,8 @@ k8s-lab-apps/
 │   └── cilium.yaml           # Application для Cilium, тоже вручную
 ├── platform/
 │   └── cilium/values.yaml    # значения Helm-чарта Cilium
+├── iac/
+│   └── vault/                # OpenTofu: конфигурация Vault
 └── workloads/                # каждая папка = одно приложение
     ├── local-path-storage/   # провижионер + kustomize-патч default class
     ├── monitoring/           # wrapper-чарт kube-prometheus-stack
@@ -346,29 +348,44 @@ kubectl -n vault exec vault-0 -- vault operator unseal \
   "$(jq -r '.unseal_keys_b64[0]' ~/vault-init.json)"
 ```
 
-Настройка Kubernetes auth. В не-dev режиме `secret/` нужно смонтировать вручную:
-
-```bash
-kubectl -n vault exec -i vault-0 -- \
-  env VAULT_TOKEN="$(jq -r .root_token ~/vault-init.json)" sh -s <<'EOF'
-vault secrets enable -path=secret kv-v2
-vault auth enable kubernetes
-vault write auth/kubernetes/config \
-  kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443"
-vault kv put secret/demo/config username=lab password=s3cret
-vault policy write demo-read - <<'POLICY'
-path "secret/data/demo/*" {
-  capabilities = ["read"]
-}
-POLICY
-vault write auth/kubernetes/role/demo \
-  bound_service_account_names=vault-demo \
-  bound_service_account_namespaces=vault-demo \
-  policies=demo-read ttl=1h
-EOF
-```
+Конфигурация Vault (mount `secret/` KV v2, auth `kubernetes`, политика и роль) описана кодом в `iac/vault/` и применяется OpenTofu, см. раздел «Vault как код (OpenTofu)». Руками остаются только `operator init`, unseal и значения самих секретов.
 
 Токен-ревью Vault делает токеном собственного ServiceAccount: чарт создаёт ему биндинг `vault-server-binding` на `system:auth-delegator`. Приложение `workloads/vault-demo` получает секрет через аннотации `vault.hashicorp.com/*` (injector добавляет init-контейнер и sidecar `vault-agent`, секрет появляется в `/vault/secrets/config.txt`). Проверка отказа: токен чужого ServiceAccount получает `403 service account name not authorized`.
+
+## Vault как код (OpenTofu)
+
+Папка `iac/vault/` лежит вне `workloads/*`, поэтому ArgoCD её не трогает.
+
+- `providers.tf`: провайдер `hashicorp/vault`, адрес и токен берутся из окружения (`VAULT_ADDR`, `VAULT_TOKEN`).
+- `main.tf`: mount `secret` (KV v2), auth `kubernetes` с конфигом (`kubernetes_host = https://kubernetes.default.svc:443`, токен ревью берётся у самого Vault), политика `demo-read` и роль `demo` (ServiceAccount `vault-demo` из namespace `vault-demo`).
+- `.terraform.lock.hcl` коммитится (фиксирует версию провайдера), `.gitignore` исключает состояние (`*.tfstate`), `.terraform/` и `*.tfvars`.
+
+**Значения секретов в код не входят**: репозиторий публичный, а значения попали бы ещё и в состояние. Секрет записывается отдельно: `vault kv put secret/demo/config username=... password=...`.
+
+Запуск на VM (OpenTofu 1.13.1, установка: `curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh -o /tmp/install-opentofu.sh`, прочитать, затем `sudo /tmp/install-opentofu.sh --install-method deb`):
+
+```bash
+kubectl -n vault port-forward svc/vault 8200:8200 >/tmp/vault-pf.log 2>&1 &
+export VAULT_ADDR=http://127.0.0.1:8200
+export VAULT_TOKEN="$(jq -r .root_token ~/vault-init.json)"   # только в окружении сессии, не в файлах
+
+cd ~/k8s-lab-apps/iac/vault
+tofu init
+tofu plan
+tofu apply
+kill %1    # остановить port-forward
+```
+
+**Пересоздание Vault с нуля**: `operator init` и unseal, затем `tofu apply`, затем `kv put` для секретов. Если на живом Vault настройка уже создана руками, `apply` упрётся в «уже существует»: сначала удалить объекты (`vault secrets disable secret`, `vault auth disable kubernetes`, `vault policy delete demo-read`) или импортировать их через `tofu import`. Роль уходит вместе с auth-бэкендом.
+
+**Состояние** лежит локально: `iac/vault/terraform.tfstate` на VM, в Git не попадает. Без него следующий `apply` на живом Vault упрётся в «уже существует», поэтому нужна копия. Секретных значений в нём нет, но файл всё равно не публиковать.
+
+**Дрейф**: ручное удаление политики видно в `tofu plan` как `~ update in-place` (провайдер читает удалённую политику как пустую), а `tofu apply` её возвращает. Проверка привязки роли: токен чужого ServiceAccount получает `403 service account name not authorized`.
+
+```bash
+TOKEN=$(kubectl -n rbac-demo create token dev-viewer)
+kubectl -n vault exec vault-0 -- vault write auth/kubernetes/login role=demo jwt="$TOKEN"
+```
 
 ## RBAC и NetworkPolicy
 
@@ -531,7 +548,7 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 
 ## Известные моменты / TODO
 
-- **Vault**: настройка (auth, политики, роли) делается руками и в Git не лежит, после каждого перезапуска пода нужен ручный unseal. Следующие шаги: провайдер `vault` для Terraform/OpenTofu и auto-unseal (transit или облачный KMS).
+- **Vault**: после каждого перезапуска пода нужен ручный unseal (auto-unseal: transit или облачный KMS). Состояние OpenTofu лежит локально на VM: кандидат на удалённый backend. Для провайдера используется root token, лучше отдельный токен с узкой политикой.
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** (controller-manager, scheduler, etcd, kube-proxy) отключены: kubeadm привязывает их к 127.0.0.1. Упражнение: открыть метрики и включить мониторы обратно; часть control-plane алертов в Prometheus из-за этого может гореть.
 - **Worker-нода** ещё не добавлена — кластер single-node.
