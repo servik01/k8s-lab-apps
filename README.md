@@ -6,10 +6,10 @@
 
 | Роль           | Hostname     | IP            | OS          |
 |----------------|--------------|---------------|-------------|
-| control-plane  | kubernetes   | 192.168.64.18 | Debian 13   |
+| control-plane  | kubernetes   | 192.168.64.55 | Debian 13   |
 | worker         | TBD          | TBD           | Debian 13   |
 
-Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.18` (прописан в `/etc/hosts` на всех нодах).
+Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (прописан в `/etc/hosts` на всех нодах).
 
 > ⚠️ На данный момент кластер single-node. Taint `node-role.kubernetes.io/control-plane:NoSchedule` снят с control-plane ноды, чтобы на ней планировались обычные поды. После добавления worker-ноды taint стоит вернуть:
 > ```bash
@@ -20,7 +20,7 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.18` (прописа�
 
 | Компонент        | Версия/примечание                                  |
 |------------------|-----------------------------------------------------|
-| Kubernetes       | v1.33.13 (через kubeadm)                             |
+| Kubernetes       | v1.34.12 (через kubeadm), etcd 3.6.5                 |
 | Container runtime| containerd (SystemdCgroup=true)                      |
 | CNI              | Cilium 1.20.1 под управлением ArgoCD (`platform/cilium/values.yaml`), `kubeProxyReplacement=true` |
 | kube-proxy       | удалён, его роль выполняет Cilium (см. раздел «Установка Cilium») |
@@ -58,7 +58,7 @@ EOF
 sudo sysctl --system
 
 # /etc/hosts — на ВСЕХ нодах
-echo "192.168.64.18 k8s-api.lab.local" | sudo tee -a /etc/hosts
+echo "192.168.64.55 k8s-api.lab.local" | sudo tee -a /etc/hosts
 ```
 
 ## Установка containerd
@@ -88,9 +88,9 @@ sudo systemctl enable containerd
 ```bash
 sudo apt install -y apt-transport-https ca-certificates curl gpg
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key | \
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | \
   sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /' | \
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | \
   sudo tee /etc/apt/sources.list.d/kubernetes.list
 
 sudo apt update
@@ -100,7 +100,7 @@ sudo apt-mark hold kubelet kubeadm kubectl
 
 ## Инициализация control-plane
 
-Выполняется **только** на control-plane ноде (192.168.64.18):
+Выполняется **только** на control-plane ноде (192.168.64.55):
 
 ```bash
 sudo kubeadm init \
@@ -141,7 +141,7 @@ cilium install \
 cilium status --wait
 ```
 
-> **kube-proxy не нужен, но нужен прямой адрес API.** Параметры `k8sServiceHost`/`k8sServicePort` обязательны, если kube-proxy удалён: иначе после перезагрузки агент Cilium пытается дойти до API через ClusterIP `10.96.0.1`, а маршрутизацию этого адреса делает он же (см. Troubleshooting). Имя `k8s-api.lab.local` работает: агент и оператор запускаются в `hostNetwork` и используют `/etc/hosts` ноды, поэтому запись `192.168.64.18 k8s-api.lab.local` на ноде обязательна (Cilium CLI подставляет адрес API из kubeconfig сам). После установки Cilium переводится под управление ArgoCD (раздел «Cilium под управлением ArgoCD»), и `cilium upgrade` больше не используется.
+> **kube-proxy не нужен, но нужен прямой адрес API.** Параметры `k8sServiceHost`/`k8sServicePort` обязательны, если kube-proxy удалён: иначе после перезагрузки агент Cilium пытается дойти до API через ClusterIP `10.96.0.1`, а маршрутизацию этого адреса делает он же (см. Troubleshooting). Имя `k8s-api.lab.local` работает: агент и оператор запускаются в `hostNetwork` и используют `/etc/hosts` ноды, поэтому запись `192.168.64.55 k8s-api.lab.local` на ноде обязательна (Cilium CLI подставляет адрес API из kubeconfig сам). После установки Cilium переводится под управление ArgoCD (раздел «Cilium под управлением ArgoCD»), и `cilium upgrade` больше не используется.
 >
 > Архитектура ноды — **arm64** (UTM/Apple Virtualization на Apple Silicon), поэтому используется `cilium-linux-arm64`, а не `amd64`.
 
@@ -211,7 +211,7 @@ kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.pas
 kubectl -n argocd port-forward --address 0.0.0.0 svc/argocd-server 8080:443
 ```
 
-Открыть: `https://192.168.64.18:8080` (логин `admin`, пароль — см. выше). Сертификат самоподписанный, браузер предупредит — это ожидаемо.
+Открыть: `https://192.168.64.55:8080` (логин `admin`, пароль — см. выше). Сертификат самоподписанный, браузер предупредит — это ожидаемо.
 
 Сменить пароль после первого входа:
 
@@ -313,7 +313,7 @@ git push "https://<user>:${MY_GH_TOKEN}@github.com/<user>/k8s-lab-apps.git" main
 Через ingress-nginx по NodePort HTTPS (30971) с самоподписанным сертификатом. На Mac в `/etc/hosts`:
 
 ```
-192.168.64.18 nginx.lab.local whoami.lab.local
+192.168.64.55 nginx.lab.local whoami.lab.local
 ```
 
 Адреса: `https://nginx.lab.local:30971`, `https://whoami.lab.local:30971`.
@@ -452,7 +452,7 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 - Мониторы control-plane включены: `kubeControllerManager` и `kubeScheduler` по HTTPS с `insecureSkipVerify` (самоподписанные сертификаты), `kubeEtcd` по HTTP на 2381. Метрики открыты правкой kubeadm-конфигурации (раздел «Конфигурация kubeadm»). `kubeProxy` выключен: kube-proxy в кластере нет.
 - `kubelet.serviceMonitor.insecureSkipVerify: true`: самоподписанный сертификат kubelet, как и в случае metrics-server.
 
-Доступ: на Mac в `/etc/hosts` добавить `192.168.64.18 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
+Доступ: на Mac в `/etc/hosts` добавить `192.168.64.55 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
 
 Полезный запрос в Prometheus: `sum by (namespace) (container_memory_working_set_bytes{container!=""})`, потребление памяти по namespace.
 
@@ -493,7 +493,7 @@ operator:
       enabled: true
 ```
 
-UI: `https://hubble.lab.local:30971` (запись в `/etc/hosts` на Mac: `192.168.64.18 hubble.lab.local`), namespace выбирается слева сверху. Hubble показывает потоки по мере появления, поэтому в тихом namespace карта пуста. Демонстрация дропа NetworkPolicy: запустить под без метки `role=client` и обращаться из него к `web`, а для сравнения из `client`:
+UI: `https://hubble.lab.local:30971` (запись в `/etc/hosts` на Mac: `192.168.64.55 hubble.lab.local`), namespace выбирается слева сверху. Hubble показывает потоки по мере появления, поэтому в тихом namespace карта пуста. Демонстрация дропа NetworkPolicy: запустить под без метки `role=client` и обращаться из него к `web`, а для сравнения из `client`:
 
 ```bash
 kubectl -n netpol-demo run intruder --image=busybox:1.37 --restart=Never -- sleep 3600
@@ -552,8 +552,9 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 По умолчанию kubeadm привязывает controller-manager (порт 10257), scheduler (10259) и метрики etcd (2381) к `127.0.0.1`, и Prometheus в кластере до них не достаёт. Параметры лежат в `platform/kubeadm/config.yaml` (`kubeadm.k8s.io/v1beta4`, где `extraArgs` это список пар `name`/`value`):
 
 - `controllerManager` и `scheduler`: `bind-address: 0.0.0.0`.
-- `etcd`: `listen-metrics-urls: http://127.0.0.1:2381,http://192.168.64.18:2381`. Loopback в списке стоит первым, чтобы пробы etcd остались на `127.0.0.1:2381`; метрики etcd идут по HTTP без аутентификации, поэтому слушаем только адрес ноды, а не все интерфейсы.
+- `etcd`: `listen-metrics-urls: http://127.0.0.1:2381,http://192.168.64.55:2381`. Loopback в списке стоит первым, чтобы пробы etcd остались на `127.0.0.1:2381`; метрики etcd идут по HTTP без аутентификации, поэтому слушаем только адрес ноды, а не все интерфейсы.
 - `InitConfiguration` закрепляет `advertiseAddress` и имя ноды, чтобы фаза `etcd` не пересчитала параметры существующего члена кластера.
+- `kubernetesVersion` **должен совпадать с реальной версией кластера** (`kubeadm version`, `kubectl get nodes`). Фазы `init phase control-plane` и `init phase etcd local` берут версии образов из этого поля: с устаревшим значением kubeadm соберёт манифесты со старыми образами (например, etcd 3.5 вместо 3.6, apiserver на минорную версию ниже), а etcd не умеет читать данные, записанные более новой версией. После `kubeadm upgrade` значение в `platform/kubeadm/config.yaml` обновляется в Git.
 
 **Манифесты в `/etc/kubernetes/manifests` руками править нельзя**: следующий `kubeadm upgrade` перезапишет их из ConfigMap `kubeadm-config`. Поэтому правится конфигурация, манифесты регенерируются фазами kubeadm, а затем конфигурация загружается обратно в кластер.
 
@@ -588,13 +589,54 @@ sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.y
 
 Откат компонента: `sudo cp $B/manifests/<файл>.yaml /etc/kubernetes/manifests/`. Если кластер совсем не поднимается, в запасе снимок etcd.
 
-Проверка: `sudo ss -tlnp | grep -E ':10257|:10259|:2381'` (у первых двух `*`, у `:2381` два адреса), `curl -s http://192.168.64.18:2381/metrics | head -3`, `kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | grep -A3 extraArgs` (три блока), затем цели `kube-controller-manager`, `kube-scheduler`, `kube-etcd` в Prometheus в состоянии `up`.
+Проверка: `sudo ss -tlnp | grep -E ':10257|:10259|:2381'` (у первых двух `*`, у `:2381` два адреса), `curl -s http://192.168.64.55:2381/metrics | head -3`, `kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | grep -A3 extraArgs` (три блока), затем цели `kube-controller-manager`, `kube-scheduler`, `kube-etcd` в Prometheus в состоянии `up`.
+
+## Смена IP ноды (например, после переноса VM)
+
+Симптомы: `kubectl` отвечает `connection refused`, в `journalctl -u kubelet` `dial tcp <старый IP>:6443: no route to host`, etcd и apiserver в CrashLoop (etcd не может занять старый адрес). Старый IP зашит в трёх местах: манифесты static pod'ов (etcd, apiserver), kubeconfig'и компонентов (`kubelet.conf`, `scheduler.conf`, `controller-manager.conf`) и сертификаты (SAN apiserver, etcd server/peer). Список файлов: `sudo grep -rl <старый IP> /etc/kubernetes`.
+
+1. Обновить `/etc/hosts` (`<новый IP> k8s-api.lab.local`) и сделать резервные копии: `sudo cp -a /etc/kubernetes ~/kubernetes-backup-newip` и `sudo cp -a /var/lib/etcd ~/etcd-data-backup`.
+2. В `platform/kubeadm/config.yaml` заменить IP (`advertiseAddress`, `listen-metrics-urls`) и **проверить `kubernetesVersion`**: он должен совпадать с реальной версией кластера.
+3. Перевести kubeconfig'и с IP на имя:
+   ```bash
+   sudo sed -i 's#https://<старый IP>:6443#https://k8s-api.lab.local:6443#' \
+     /etc/kubernetes/{kubelet,scheduler,controller-manager}.conf
+   ```
+4. Перевыпустить сертификаты (старые убрать, иначе kubeadm их не пересоздаст):
+   ```bash
+   mkdir -p ~/old-pki
+   sudo mv /etc/kubernetes/pki/apiserver.{crt,key} ~/old-pki/
+   sudo mv /etc/kubernetes/pki/etcd/server.{crt,key} ~/old-pki/
+   sudo mv /etc/kubernetes/pki/etcd/peer.{crt,key} ~/old-pki/
+   sudo kubeadm init phase certs apiserver   --config platform/kubeadm/config.yaml
+   sudo kubeadm init phase certs etcd-server --config platform/kubeadm/config.yaml
+   sudo kubeadm init phase certs etcd-peer   --config platform/kubeadm/config.yaml
+   ```
+5. В манифестах etcd и apiserver заменить IP: `sudo sed -i 's/<старый IP>/<новый IP>/g' /etc/kubernetes/manifests/{etcd,kube-apiserver}.yaml`, затем проверить, что образы остались прежними (`grep image: /etc/kubernetes/manifests/*.yaml`). Регенерация через `kubeadm init phase` допустима только при актуальном `kubernetesVersion` (см. раздел «Конфигурация kubeadm»).
+6. `sudo systemctl restart kubelet`, затем **перезапустить scheduler и controller-manager**: static pod читает kubeconfig только при старте. Если этого не сделать, поды не создаются и не планируются (scheduler в `0/1 Running`, ReplicaSet не порождает поды):
+   ```bash
+   sudo mv /etc/kubernetes/manifests/kube-scheduler.yaml /etc/kubernetes/manifests/kube-controller-manager.yaml /tmp/
+   sleep 20
+   sudo mv /tmp/kube-scheduler.yaml /tmp/kube-controller-manager.yaml /etc/kubernetes/manifests/
+   ```
+7. После подъёма API обновить peer URL в etcd и загрузить конфигурацию обратно:
+   ```bash
+   kubectl -n kube-system exec etcd-kubernetes -- etcdctl --endpoints=https://127.0.0.1:2379 \
+     --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+     --key=/etc/kubernetes/pki/etcd/server.key member list -w table
+   # затем member update <ID> --peer-urls=https://<новый IP>:2380 (те же флаги)
+   sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.yaml
+   ```
+8. Распечатать Vault, проверить `cilium status`, `kubectl get pods -A | grep -v Running` и статусы Application в ArgoCD. Поды, зависшие в `Unknown` с момента потери ноды, удалить: Deployment создаст новые. Обновить `/etc/hosts` на клиентских машинах. Если Vault-injector не успел стартовать к моменту пересоздания пода, `vault-demo` поднимется без sidecar `vault-agent`: удалить под ещё раз после того, как `vault-agent-injector` станет `Ready`.
+
+Чтобы упростить следующий переезд: DHCP-резервация или статический IP для VM.
 
 ## Известные моменты / TODO
 
 - **Vault**: после каждого перезапуска пода нужен ручный unseal (auto-unseal: transit или облачный KMS). Состояние OpenTofu лежит локально на VM: кандидат на удалённый backend. Для провайдера используется root token, лучше отдельный токен с узкой политикой.
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** открыты на адресе ноды: controller-manager и scheduler требуют токен с правом на `/metrics` (у Prometheus он есть), а метрики etcd идут по HTTP без аутентификации. Для лабы это приемлемо, на проде такие порты закрывают сетевыми политиками или файрволом.
+- **IP ноды** не закреплён за VM (меняется при переносе на другой хост): настроить DHCP-резервацию или статический адрес; порядок действий при смене IP — раздел «Смена IP ноды».
 - **Worker-нода** ещё не добавлена — кластер single-node.
 - **Taint control-plane** снят ради возможности шедулить поды на единственной ноде — вернуть после добавления worker.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.
