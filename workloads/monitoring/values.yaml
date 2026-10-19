@@ -11,6 +11,10 @@ kube-prometheus-stack:
       enabled: true
       storageClassName: local-path
       size: 1Gi
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
     ingress:
       enabled: true
       ingressClassName: nginx
@@ -37,6 +41,10 @@ kube-prometheus-stack:
             - prometheus.lab.local
     prometheusSpec:
       retention: 7d
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       serviceMonitorSelectorNilUsesHelmValues: false
       podMonitorSelectorNilUsesHelmValues: false
       resources:

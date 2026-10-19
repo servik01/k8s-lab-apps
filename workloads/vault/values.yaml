@@ -20,6 +20,10 @@ vault:
         memory: 128Mi
       limits:
         memory: 512Mi
+    tolerations: |
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
   injector:
     enabled: true
   ui:
