@@ -7,14 +7,13 @@
 | Роль           | Hostname     | IP            | OS          |
 |----------------|--------------|---------------|-------------|
 | control-plane  | kubernetes   | 192.168.64.55 | Debian 13   |
-| worker         | TBD          | TBD           | Debian 13   |
+| worker         | k8s-worker   | 192.168.64.57 | Debian 13   |
 
 Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (прописан в `/etc/hosts` на всех нодах).
 
-> ⚠️ На данный момент кластер single-node. Taint `node-role.kubernetes.io/control-plane:NoSchedule` снят с control-plane ноды, чтобы на ней планировались обычные поды. После добавления worker-ноды taint стоит вернуть:
-> ```bash
-> kubectl taint nodes kubernetes node-role.kubernetes.io/control-plane:NoSchedule
-> ```
+Кластер из двух нод. На control-plane стоит штатный taint `node-role.kubernetes.io/control-plane:NoSchedule`, обычные нагрузки планируются на worker. Исключение: Vault, Prometheus и Grafana. Их тома на `local-path` привязаны к ноде, где созданы (к control-plane), поэтому в их `values.yaml` прописаны `tolerations` для этого taint (`workloads/vault`: `server.tolerations` строкой, `workloads/monitoring`: `grafana.tolerations` и `prometheus.prometheusSpec.tolerations`). Без них после пересоздания такие поды зависли бы в `Pending`. StatefulSet Vault обновляется по `OnDelete`: после смены шаблона `vault-0` нужно удалить вручную и распечатать.
+
+Файрвол на worker (`ufw`): разрешён весь трафик с control-plane (`sudo ufw allow from 192.168.64.55`). Без этого control-plane не достаёт до kubelet (порт 10250), и `kubectl exec`/`logs` с worker падают с `i/o timeout`. На control-plane `ufw` не установлен.
 
 ## Стек
 
@@ -637,8 +636,9 @@ sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.y
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** открыты на адресе ноды: controller-manager и scheduler требуют токен с правом на `/metrics` (у Prometheus он есть), а метрики etcd идут по HTTP без аутентификации. Для лабы это приемлемо, на проде такие порты закрывают сетевыми политиками или файрволом.
 - **IP ноды** не закреплён за VM (меняется при переносе на другой хост): настроить DHCP-резервацию или статический адрес; порядок действий при смене IP — раздел «Смена IP ноды».
-- **Worker-нода** ещё не добавлена — кластер single-node.
-- **Taint control-plane** снят ради возможности шедулить поды на единственной ноде — вернуть после добавления worker.
+- **Данные на `local-path`** привязаны к ноде (control-plane) и не переезжают: при потере этой ноды Vault, Prometheus и Grafana не поднимутся на worker. Для настоящей отказоустойчивости нужно реплицируемое хранилище (Longhorn, Rook-Ceph или NFS) и восстановление из снимков.
+- **Файрвол worker**: в `ufw` остались правила от прежнего одноузлового кластера на Calico (BGP 179, VXLAN 4789, Typha 5473, `10.244.0.0/16`), для этого кластера они не нужны. Таблица nftables `ansible_nodeport` режет NodePort (30000–32767) для всех источников, кроме `10.244.0.0/16` и `192.168.64.57`: если ingress-nginx переедет на worker, в `allowed_v4` нужно добавить `192.168.64.0/24`.
+- **Версия containerd** на нодах разная (control-plane 2.3.6, worker 2.4.2): выровнять и закрепить `apt-mark hold containerd.io`.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.
 - **Установка ArgoCD**: манифест `install.yaml` при обычном `kubectl apply` не применяет CRD `applicationsets.argoproj.io` (см. Troubleshooting). Для обновлений использовать `kubectl apply --server-side --force-conflicts`.
 - **ApplicationSet** лежит в `bootstrap/` и применяется вручную. Его можно отдать под GitOps отдельным Application, а в `spec` добавить `syncPolicy.preserveResourcesOnDeletion: true`, чтобы удаление ApplicationSet не сносило workloads.
@@ -657,6 +657,15 @@ sudo rm -rf /etc/cni/net.d /var/lib/etcd $HOME/.kube /etc/kubernetes/manifests/*
 sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
 sudo systemctl restart containerd kubelet
 ```
+
+**`kubeadm join` на новой VM: `FileAvailable--etc-kubernetes-kubelet.conf already exists`, а `hostname -I` показывает IP worker, не control-plane**
+На VM остался собственный кластер (в этой лабе: одноузловой кластер на Calico, поднятый при подготовке образа). Признак: в `/etc/kubernetes/manifests` лежат `etcd.yaml` и `kube-apiserver.yaml`, `ss -tlnp` показывает 6443 и 2379. Лечение: `kubeadm reset -f` и очистка из блока выше; предупреждения `calico ... 10.96.0.1:443 connection refused` при `reset` ожидаемы (API старого кластера уже мёртв). Затем `rm -rf /var/lib/cni /var/lib/calico /var/run/calico`, перезагрузка (убирает интерфейсы `cali*`/`tunl0` и зависшие sandbox'ы), проверка `/proc/swaps`, после этого новый `join` со свежим токеном. Перед `reset` обязательно убедиться, что команда выполняется на worker, а не на control-plane.
+
+**`kubectl exec` / `logs` для пода на worker: `dial tcp <worker-ip>:10250: i/o timeout`**
+Control-plane не достаёт до kubelet worker: порт закрыт файрволом (`ufw` с `default deny incoming`). Join при этом проходит, потому что идёт в обратную сторону (worker → API). Лечение на worker: `sudo ufw allow from <control-plane-ip>`. Проверка: `nc -zv -w3 <worker-ip> 10250` с control-plane.
+
+**`sudo: unable to resolve host <имя>` на новой VM**
+Hostname сменили, а в `/etc/hosts` остался `127.0.1.1 <старое имя>`. Исправить строку `127.0.1.1` на актуальный hostname (kubelet регистрирует ноду по hostname).
 
 **`dial tcp <control-plane-ip>:6443: connect: connection refused` при `join`**
 API-сервер не слушает порт — либо `init` не выполнялся на этой ноде, либо control-plane компоненты были случайно удалены (например, через `kubeadm reset`, выполненный по ошибке на control-plane ноде). Проверить `sudo ss -tlnp | grep 6443` и `sudo crictl ps -a` на предполагаемой control-plane ноде.
