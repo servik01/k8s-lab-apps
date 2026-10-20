@@ -2,7 +2,7 @@
 
 [Русский](README.md) | **English**
 
-A Kubernetes lab cluster deployed with `kubeadm` to study production-style architecture (unlike k3s/k0s/MicroK8s, which hide or simplify many components).
+A Kubernetes lab cluster deployed with `kubeadm` for learning and experimentation.
 
 ## Topology
 
