@@ -165,8 +165,15 @@ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/cont
 
 # Нет облачного LoadBalancer — переключаем на NodePort
 kubectl -n ingress-nginx patch svc ingress-nginx-controller -p '{"spec": {"type": "NodePort"}}'
+
+# Манифест cloud/deploy.yaml ставит externalTrafficPolicy: Local: NodePort тогда отвечает
+# только на той ноде, где стоит под. С двумя нодами это ломает доступ: под может переехать
+# на worker, а /etc/hosts на клиенте указывает на control-plane. Переключаем на Cluster.
+kubectl -n ingress-nginx patch svc ingress-nginx-controller -p '{"spec": {"externalTrafficPolicy": "Cluster"}}'
 kubectl -n ingress-nginx get svc ingress-nginx-controller
 ```
+
+При `Cluster` NodePort отвечает на любой ноде и пересылает трафик на под, где бы он ни стоял; цена: приложение видит адрес ноды, а не реальный IP клиента (для лабы не важно). Симптом `Local`: `curl` на NodePort control-plane молчит, а напрямую на ноду с подом возвращает 200.
 
 ## cert-manager
 
