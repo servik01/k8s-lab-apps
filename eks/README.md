@@ -16,3 +16,19 @@ Bootstrap и инструкция установки Argo CD: https://github.com
 kubectl --context example-eks -n argocd get applicationsets,applications
 kubectl --context example-eks -n whoami get pods,service
 ```
+
+## Дополнительные демо
+
+- `nginx-demo`: две реплики nginx, ClusterIP Service, без Ingress. Открыть: `kubectl --context example-eks -n nginx-demo port-forward svc/nginx-demo 8082:80`, затем http://localhost:8082.
+- `rbac-demo`: Deployment/sample и ServiceAccount/dev-viewer. Role разрешает чтение pods и pods/log в namespace rbac-demo; ClusterRole/eks-demo-node-reader разрешает чтение nodes. Изменение ресурсов не разрешено. ClusterRole и ClusterRoleBinding имеют отдельные имена для EKS-демо.
+
+Проверка RBAC от имени ServiceAccount (команды выполняет администратор с правом impersonate):
+
+```sh
+kubectl --context example-eks auth can-i list pods -n rbac-demo --as=system:serviceaccount:rbac-demo:dev-viewer
+kubectl --context example-eks auth can-i get nodes --as=system:serviceaccount:rbac-demo:dev-viewer
+kubectl --context example-eks auth can-i delete pods -n rbac-demo --as=system:serviceaccount:rbac-demo:dev-viewer
+kubectl --context example-eks auth can-i get secrets -n rbac-demo --as=system:serviceaccount:rbac-demo:dev-viewer
+```
+
+Ожидается: yes, yes, no, no. На EKS не добавлены домашние local-path, Vault, monitoring и netpol-demo: им нужна отдельная настройка storage, зависимостей или enforcement сетевых политик.
