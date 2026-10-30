@@ -725,3 +725,8 @@ ApplicationSet читает Git через кэш repo-server (до нескол
 
 **`kubectl exec` сразу после удаления пода: `container not found`**
 Гонка: контейнер ещё не создан. Подожди несколько секунд и повтори.
+
+
+## AWS EKS GitOps
+
+EKS applications use a separate directory, [`eks/workloads/`](eks/README.md), discovered automatically by ApplicationSet. The home lab continues to use `workloads/*`.
