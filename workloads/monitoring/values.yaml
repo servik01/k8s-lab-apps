@@ -3,7 +3,9 @@ kube-prometheus-stack:
     enabled: false
 
   grafana:
-    replicas: 0
+    replicas: 1
+    nodeSelector:
+      kubernetes.io/hostname: k8s-worker
     admin:
       existingSecret: grafana-admin
       userKey: admin-user
@@ -12,10 +14,6 @@ kube-prometheus-stack:
       enabled: true
       storageClassName: local-path
       size: 1Gi
-    tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
     ingress:
       enabled: true
       ingressClassName: nginx
