@@ -754,3 +754,8 @@ ApplicationSet reads Git through the repo-server cache, which can take several m
 **`kubectl exec` immediately after deleting a pod: `container not found`**
 
 A race condition: the container has not been created yet. Wait a few seconds and retry.
+
+
+## AWS EKS GitOps
+
+EKS applications use a separate directory, [`eks/workloads/`](eks/README.md), discovered automatically by ApplicationSet. The home lab continues to use `workloads/*`.
