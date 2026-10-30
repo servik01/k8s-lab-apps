@@ -6,14 +6,16 @@
 
 ## Топология
 
-| Роль           | Hostname     | IP            | OS          |
-|----------------|--------------|---------------|-------------|
-| control-plane  | kubernetes   | 192.168.64.55 | Debian 13   |
-| worker         | k8s-worker   | 192.168.64.57 | Debian 13   |
+| Роль | Hostname | IP | OS | RAM |
+|------|----------|----|----|-----|
+| control-plane | kubernetes | 192.168.64.55 | Debian 13 | 6 GB |
+| worker | k8s-worker | 192.168.64.57 | Debian 13 | 4 GB |
 
 Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (прописан в `/etc/hosts` на всех нодах).
 
-Кластер из двух нод. На control-plane стоит штатный taint `node-role.kubernetes.io/control-plane:NoSchedule`, обычные нагрузки планируются на worker. Исключение: Vault, Prometheus и Grafana. Их тома на `local-path` привязаны к ноде, где созданы (к control-plane), поэтому в их `values.yaml` прописаны `tolerations` для этого taint (`workloads/vault`: `server.tolerations` строкой, `workloads/monitoring`: `grafana.tolerations` и `prometheus.prometheusSpec.tolerations`). Без них после пересоздания такие поды зависли бы в `Pending`. StatefulSet Vault обновляется по `OnDelete`: после смены шаблона `vault-0` нужно удалить вручную и распечатать.
+Кластер из двух нод. На control-plane стоит штатный taint `node-role.kubernetes.io/control-plane:NoSchedule`, обычные нагрузки планируются на worker. Vault и Prometheus остаются на control-plane: их `local-path`-тома привязаны к этой ноде, поэтому в values заданы tolerations (`workloads/vault`: `server.tolerations` строкой; `workloads/monitoring`: `prometheus.prometheusSpec.tolerations`). StatefulSet Vault обновляется по `OnDelete`: после изменения шаблона под пересоздаётся вручную и требует unseal.
+
+ArgoCD и Grafana перенесены на worker для разгрузки control-plane. Grafana использует отдельный статический local PV/PVC `grafana-worker-data`, данные скопированы с сохранением владельцев и прав. Память control-plane уменьшена с 8 до 6 GB; после перезапуска обе ноды `Ready`, все девять Application `Synced / Healthy`. Последний замер: control-plane 2925 MiB (50%), worker 2166 MiB (56%); это наблюдение после загрузки, а не гарантия пикового потребления.
 
 Файрвол на worker (`ufw`, `default deny incoming`): остались только SSH (22) и весь трафик с control-plane (`sudo ufw allow from 192.168.64.55`). Без второго правила control-plane не достаёт до kubelet (порт 10250), и `kubectl exec`/`logs` для подов на worker падают с `i/o timeout`. Правила под Calico (BGP, VXLAN, Typha, `10.244.0.0/16`) удалены: Cilium ходит между нодами по трафику, разрешённому правилом для control-plane. Отдельно на worker загружается таблица nftables `ansible_nodeport` (`/etc/nftables.d/ansible-nodeport.nft`, юнит `ansible-nodeport-firewall.service`): она пропускает NodePort (30000–32767) только из перечисленных подсетей, в их число добавлена `192.168.64.0/24`, иначе доступ с Mac к ingress-nginx ломается, когда он оказывается на worker. На control-plane `ufw` не установлен.
 
@@ -227,6 +229,10 @@ kubectl -n argocd port-forward --address 0.0.0.0 svc/argocd-server 8080:443
 argocd account update-password
 ```
 
+### Размещение ArgoCD
+
+Все пять активных компонентов ArgoCD перенесены на `k8s-worker`: `argocd-repo-server`, `argocd-application-controller` (StatefulSet), `argocd-redis`, `argocd-server`, `argocd-applicationset-controller`. PVC в namespace `argocd` нет. Размещение задано ручными патчами `spec.template.spec.nodeSelector` с `kubernetes.io/hostname: k8s-worker`; эти настройки ещё нужно сохранить в декларативной установке ArgoCD. Dex и notifications-controller остаются с нулём реплик.
+
 ## GitOps-репозиторий (`k8s-lab-apps`)
 
 Публичный репозиторий `https://github.com/servik01/k8s-lab-apps`, ветка `main`. ArgoCD читает его без дополнительных credentials.
@@ -419,6 +425,8 @@ KUBECONFIG=/dev/null kubectl --server=https://k8s-api.lab.local:6443 \
 
 ## Эксплуатация: после перезагрузки VM
 
+Ноды обслуживаются по одной. При выключении control-plane API, Vault и Prometheus недоступны, worker можно оставить включённым. После изменения RAM control-plane до 6144 MiB выполнены запуск, unseal Vault и проверка приложений. После перезапуска одного worker Vault не требует unseal, если `vault-0` не перезапускался. `/proc/swaps` проверяется на обеих нодах.
+
 Kubernetes стартует сам (`containerd` и `kubelet` в автозапуске), на подъём нужно 3–5 минут. Вручную после перезагрузки:
 
 1. Распечатать Vault (команда выше), иначе `vault-demo` и все поды с injector'ом остаются не готовы.
@@ -431,6 +439,36 @@ cat /proc/swaps                                  # только заголово
 kubectl get nodes
 kubectl get pods -A | grep -v ' Running '
 ```
+
+## Бэкапы etcd
+
+На control-plane установлен `/usr/local/sbin/etcd-snapshot.sh`. Он создаёт снимок через `etcdctl` внутри `etcd-kubernetes`, проверяет чтение через `etcdutl snapshot status` и только после успеха удаляет снимки старше семи дней. Файлы лежат в `/var/lib/etcd/snapshots` (каталог `0700`, файлы `0600`). Для запуска от root используется `/etc/kubernetes/admin.conf`.
+
+`etcd-snapshot.timer` запускает службу ежедневно в 03:00 UTC с задержкой до пяти минут. `Persistent=true` позволяет выполнить пропущенный запуск после загрузки VM. `etcd-snapshot.service` имеет `Restart=on-failure`, повтор через пять минут и таймаут пять минут. Скрипт и units добавлены в отдельную роль `etcd_backup` и playbook `etcd-backup.yml` репозитория [ansible-create-kubeadm](https://github.com/servik01/ansible-create-kubeadm/tree/main/roles/etcd_backup); применение Ansible в лабе пока отложено, текущая установка выполнена вручную.
+
+```bash
+sudo systemctl start etcd-snapshot.service
+sudo systemctl status etcd-snapshot.service --no-pager
+sudo systemctl list-timers --all etcd-snapshot.timer
+sudo journalctl -u etcd-snapshot.service -n 25 --no-pager
+```
+
+Для `Type=oneshot` после успеха нормально `inactive (dead)` с `status=0/SUCCESS`. Проверено создание снимков около 24 MB и пробное `etcdutl snapshot restore` в отдельный каталог внутри `/var/lib/etcd`. Контрольная сумма прошла проверку, данные восстановились, обе ноды остались `Ready`; тестовый каталог затем удалён. Запуск восстановленного etcd и восстановление всего кластера не проверялись.
+
+Снимки содержат Kubernetes Secrets и не должны попадать в Git. Они не включают данные PVC, PKI и внешние ключи шифрования. Внешнее копирование пока не настроено: потеря диска control-plane уничтожит и etcd, и его локальные снимки.
+
+## Практика drain / uncordon
+
+Выполнен `drain` единственного worker при отсутствии PDB. Обычные поды были выселены, DaemonSet-поды остались; CoreDNS создал замену на control-plane. Приложения без toleration остались `Pending`: control-plane имел taint, worker был закрыт для планирования.
+
+```bash
+kubectl drain k8s-worker --ignore-daemonsets --delete-emptydir-data --timeout=180s
+kubectl uncordon k8s-worker
+```
+
+Это команды учебного обслуживания с простоем приложений: `--delete-emptydir-data` разрешает удаление временных данных `emptyDir`. Drain ждёт удаления старых подов, а не готовности замен. После `uncordon` ожидающие поды запустились автоматически, все Application вернулись в `Synced / Healthy`, nginx и whoami ответили HTTP 200 через NodePort control-plane.
+
+Упражнение проводилось до переноса ArgoCD и Grafana на worker. Теперь drain затронет и их, а Grafana привязана к worker локальным томом. Две реплики на одной доступной для них ноде не защищают от её обслуживания. PDB пока не добавлен.
 
 ## Мониторинг (kube-prometheus-stack)
 
@@ -454,7 +492,8 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 
 - Alertmanager выключен (экономия памяти, уведомления в лабе не нужны).
 - Grafana и Prometheus за ingress-nginx с TLS от `selfsigned-issuer` (`grafana.lab.local`, `prometheus.lab.local`).
-- Хранилище на `local-path`: Grafana 1Gi, Prometheus 5Gi, retention 7 дней.
+- Prometheus: 5Gi на `local-path` control-plane, retention 7 дней; toleration позволяет пересоздать под на этой ноде.
+- Grafana: 1Gi, `persistence.existingClaim: grafana-worker-data`, `nodeSelector` на `k8s-worker`, без toleration control-plane. Статические PV/PVC описаны в `workloads/monitoring/templates/grafana-worker-storage.yaml`: `storageClassName: ""`, `Retain`, local path `/opt/local-path-provisioner/grafana-worker-data`.
 - `serviceMonitorSelectorNilUsesHelmValues: false` и `podMonitorSelectorNilUsesHelmValues: false`: Prometheus подхватывает ServiceMonitor и PodMonitor любых приложений, а не только с меткой этого релиза.
 - Сертификаты webhook'а оператора выпускает cert-manager (`admissionWebhooks.certManager.enabled`, джобы выключены): так нет hook-джоб и дрейфа `caBundle` в Argo.
 - Мониторы control-plane включены: `kubeControllerManager` и `kubeScheduler` по HTTPS с `insecureSkipVerify` (самоподписанные сертификаты), `kubeEtcd` по HTTP на 2381. Метрики открыты правкой kubeadm-конфигурации (раздел «Конфигурация kubeadm»). `kubeProxy` выключен: kube-proxy в кластере нет.
@@ -463,6 +502,14 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 Доступ: на Mac в `/etc/hosts` добавить `192.168.64.55 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
 
 Полезный запрос в Prometheus: `sum by (namespace) (container_memory_working_set_bytes{container!=""})`, потребление памяти по namespace.
+
+### Перенос Grafana на worker
+
+Grafana остановлена через `replicas: 0` в Git, после синхронизации ArgoCD и удаления пода сделан архив данных. Старому PV `pvc-ad02317a-3577-45d3-bcc9-805e5fdfc2c3` выставлен `Retain`. Архив передан на worker по SSH, SHA-256 совпал; восстановлено 55 MB данных с владельцем `472:472`, каталог ограничен правами `0750`.
+
+После создания нового PV/PVC и состояния `Bound` в values заданы `existingClaim`, размещение на worker и `replicas: 1`. Grafana запустилась `3/3 Running`; работа UI и сохранность данных подтверждены. Архивы `/var/backups/grafana-migration/grafana-data.tar.gz` на обеих нодах и старые данные на control-plane пока сохранены для отката. Старый PVC мог быть удалён ArgoCD при prune; исходный каталог сохраняет политика PV `Retain`.
+
+При установке с нуля каталог на worker нужно заранее создать и назначить владельца `472:472`; манифест статического PV сам не создаёт каталог и не восстанавливает данные. При будущих обновлениях Grafana учитывать `ReadWriteOnce`: на время миграции/работ с томом под должен быть остановлен; для обновлений без двух одновременно пишущих подов использовать стратегию `Recreate`.
 
 ## Наблюдаемость сети (Hubble)
 
@@ -645,7 +692,7 @@ sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.y
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** открыты на адресе ноды: controller-manager и scheduler требуют токен с правом на `/metrics` (у Prometheus он есть), а метрики etcd идут по HTTP без аутентификации. Для лабы это приемлемо, на проде такие порты закрывают сетевыми политиками или файрволом.
 - **IP ноды** не закреплён за VM (меняется при переносе на другой хост): настроить DHCP-резервацию или статический адрес; порядок действий при смене IP — раздел «Смена IP ноды».
-- **Данные на `local-path`** привязаны к ноде (control-plane) и не переезжают: при потере этой ноды Vault, Prometheus и Grafana не поднимутся на worker. Для настоящей отказоустойчивости нужно реплицируемое хранилище (Longhorn, Rook-Ceph или NFS) и восстановление из снимков.
+- **Локальные тома** привязаны к нодам: Vault и Prometheus — к control-plane, Grafana — к worker. Автоматического переноса данных между ними нет; нужны бэкапы томов или хранилище с подходящей отказоустойчивостью.
 - **Файрвол worker**: в `allowed_v4` таблицы `ansible_nodeport` по-прежнему стоит `10.244.0.0/16` от прежнего кластера на Calico, для Cilium он не нужен. При пересоздании worker-VM нужно заново выставить правила `ufw` и подсеть в таблице, иначе будут падать `exec`/`logs` и NodePort.
 - **Версия containerd** на нодах разная (control-plane 2.3.6, worker 2.4.2): выровнять и закрепить `apt-mark hold containerd.io`.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.

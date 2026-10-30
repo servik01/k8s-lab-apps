@@ -6,14 +6,16 @@ A Kubernetes lab cluster deployed with `kubeadm` for learning and experimentatio
 
 ## Topology
 
-| Role | Hostname | IP | OS |
-|------|----------|----|----|
-| control-plane | kubernetes | 192.168.64.55 | Debian 13 |
-| worker | k8s-worker | 192.168.64.57 | Debian 13 |
+| Role | Hostname | IP | OS | RAM |
+|------|----------|----|----|-----|
+| control-plane | kubernetes | 192.168.64.55 | Debian 13 | 6 GB |
+| worker | k8s-worker | 192.168.64.57 | Debian 13 | 4 GB |
 
 Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (configured in `/etc/hosts` on every node).
 
-The cluster has two nodes. The control-plane has the standard `node-role.kubernetes.io/control-plane:NoSchedule` taint, so regular workloads run on the worker. Vault, Prometheus, and Grafana are exceptions: their `local-path` volumes are tied to the node where they were created (the control-plane). Their `values.yaml` files therefore include tolerations for this taint (`workloads/vault`: `server.tolerations` as a string; `workloads/monitoring`: `grafana.tolerations` and `prometheus.prometheusSpec.tolerations`). Without these, recreated pods would remain `Pending`. Vault's StatefulSet uses `OnDelete`: after changing its template, manually delete `vault-0` and unseal the replacement.
+The cluster has two nodes. The control-plane has the standard `node-role.kubernetes.io/control-plane:NoSchedule` taint, so regular workloads run on the worker. Vault and Prometheus remain on the control-plane: their `local-path` volumes are tied to that node, so values include tolerations (`workloads/vault`: `server.tolerations` as a string; `workloads/monitoring`: `prometheus.prometheusSpec.tolerations`). Vault's StatefulSet uses `OnDelete`: after changing its template, manually recreate the pod and unseal it.
+
+ArgoCD and Grafana have moved to the worker to reduce control-plane memory usage. Grafana uses a separate static local PV/PVC, `grafana-worker-data`; its data was copied with ownership and permissions preserved. Control-plane RAM was reduced from 8 to 6 GB. After reboot, both nodes were `Ready` and all nine Applications were `Synced / Healthy`. The latest reading was 2925 MiB (50%) on the control-plane and 2166 MiB (56%) on the worker; this is a post-boot observation, not a peak usage guarantee.
 
 The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and all traffic from the control-plane (`sudo ufw allow from 192.168.64.55`). Without the latter rule, the control-plane cannot reach kubelet (port 10250), and `kubectl exec`/`logs` for worker pods fail with `i/o timeout`. Calico rules (BGP, VXLAN, Typha, `10.244.0.0/16`) have been removed: Cilium's traffic between these nodes is covered by the control-plane rule. The worker also loads the nftables table `ansible_nodeport` (`/etc/nftables.d/ansible-nodeport.nft`, unit `ansible-nodeport-firewall.service`). It permits NodePort traffic (30000–32767) only from listed subnets; `192.168.64.0/24` was added so the Mac can access ingress-nginx when it runs on the worker. The control-plane does not have `ufw` installed.
 
@@ -227,6 +229,10 @@ Change the password after the first login:
 argocd account update-password
 ```
 
+### ArgoCD placement
+
+All five active ArgoCD components now run on `k8s-worker`: `argocd-repo-server`, `argocd-application-controller` (StatefulSet), `argocd-redis`, `argocd-server`, and `argocd-applicationset-controller`. Namespace `argocd` has no PVCs. Placement was set through manual patches to `spec.template.spec.nodeSelector` with `kubernetes.io/hostname: k8s-worker`; these settings still need to be captured in the declarative ArgoCD installation. Dex and notifications-controller remain scaled to zero.
+
 ## GitOps repository (`k8s-lab-apps`)
 
 Public repository: `https://github.com/servik01/k8s-lab-apps`, branch `main`. ArgoCD reads it without additional credentials.
@@ -419,6 +425,8 @@ KUBECONFIG=/dev/null kubectl --server=https://k8s-api.lab.local:6443 \
 
 ## Operations: after a VM reboot
 
+Maintain nodes one at a time. While the control-plane is off, the API, Vault, and Prometheus are unavailable; the worker can remain running. After setting control-plane RAM to 6144 MiB, the VM was started, Vault unsealed, and applications checked. Restarting only the worker does not require unsealing Vault unless `vault-0` also restarted. Check `/proc/swaps` on both nodes.
+
 Kubernetes starts automatically (`containerd` and `kubelet` are enabled at boot); allow 3–5 minutes. Manual steps after reboot:
 
 1. Unseal Vault (command above), otherwise `vault-demo` and other pods using the injector remain unready.
@@ -431,6 +439,36 @@ cat /proc/swaps                                  # header only
 kubectl get nodes
 kubectl get pods -A | grep -v ' Running '
 ```
+
+## etcd backups
+
+The control-plane runs `/usr/local/sbin/etcd-snapshot.sh`. It creates snapshots using `etcdctl` inside `etcd-kubernetes`, checks readability with `etcdutl snapshot status`, and deletes snapshots older than seven days only after success. Files are stored in `/var/lib/etcd/snapshots` (directory `0700`, files `0600`). Root execution uses `/etc/kubernetes/admin.conf`.
+
+`etcd-snapshot.timer` runs daily at 03:00 UTC with up to five minutes of delay. `Persistent=true` catches up on a missed run after VM boot. `etcd-snapshot.service` uses `Restart=on-failure`, a five-minute retry delay, and a five-minute timeout. The script and units were added to the separate `etcd_backup` role and `etcd-backup.yml` playbook in [ansible-create-kubeadm](https://github.com/servik01/ansible-create-kubeadm/tree/main/roles/etcd_backup). Applying Ansible in the lab is deferred; the current installation was configured manually.
+
+```bash
+sudo systemctl start etcd-snapshot.service
+sudo systemctl status etcd-snapshot.service --no-pager
+sudo systemctl list-timers --all etcd-snapshot.timer
+sudo journalctl -u etcd-snapshot.service -n 25 --no-pager
+```
+
+For `Type=oneshot`, `inactive (dead)` with `status=0/SUCCESS` is expected after success. Snapshots of about 24 MB were created and a trial `etcdutl snapshot restore` into a separate directory under `/var/lib/etcd` succeeded. The checksum was verified, data was restored, and both nodes remained `Ready`; the test directory was then removed. Starting the restored etcd and full cluster recovery have not been tested.
+
+Snapshots contain Kubernetes Secrets and must stay out of Git. They exclude PVC data, PKI, and external encryption keys. Off-node copying is not configured: losing the control-plane disk would lose both etcd and its local snapshots.
+
+## Drain / uncordon exercise
+
+The only worker was drained with no PDBs present. Regular pods were evicted while DaemonSet pods remained; CoreDNS created a replacement on the control-plane. Applications without a toleration stayed `Pending`: the control-plane was tainted and the worker was unschedulable.
+
+```bash
+kubectl drain k8s-worker --ignore-daemonsets --delete-emptydir-data --timeout=180s
+kubectl uncordon k8s-worker
+```
+
+These maintenance exercise commands cause application downtime; `--delete-emptydir-data` permits deletion of temporary `emptyDir` data. Drain waits for old pods to be deleted, not for replacements to become ready. After `uncordon`, pending pods started automatically, all Applications returned to `Synced / Healthy`, and nginx and whoami returned HTTP 200 through the control-plane NodePort.
+
+The exercise preceded the move of ArgoCD and Grafana to the worker. Draining now affects them too, and Grafana's local volume ties it to the worker. Two replicas on a single eligible node do not protect against maintenance of that node. No PDB has been added yet.
 
 ## Monitoring (kube-prometheus-stack)
 
@@ -454,7 +492,8 @@ Key `values.yaml` settings:
 
 - Alertmanager is disabled to save memory; notifications are unnecessary for this lab.
 - Grafana and Prometheus are exposed through ingress-nginx with TLS from `selfsigned-issuer` (`grafana.lab.local`, `prometheus.lab.local`).
-- Storage uses `local-path`: Grafana 1Gi, Prometheus 5Gi, retention 7 days.
+- Prometheus: 5Gi on control-plane `local-path`, 7-day retention; a toleration allows its pod to restart on that node.
+- Grafana: 1Gi, `persistence.existingClaim: grafana-worker-data`, `nodeSelector` targeting `k8s-worker`, no control-plane toleration. Static PV/PVC definitions are in `workloads/monitoring/templates/grafana-worker-storage.yaml`: `storageClassName: ""`, `Retain`, local path `/opt/local-path-provisioner/grafana-worker-data`.
 - `serviceMonitorSelectorNilUsesHelmValues: false` and `podMonitorSelectorNilUsesHelmValues: false`: Prometheus discovers ServiceMonitor and PodMonitor resources from all applications, regardless of this release's label.
 - cert-manager issues the operator webhook certificates (`admissionWebhooks.certManager.enabled`, jobs disabled), avoiding hook jobs and `caBundle` drift in Argo.
 - Control-plane monitors are enabled: `kubeControllerManager` and `kubeScheduler` over HTTPS with `insecureSkipVerify` (self-signed certificates), `kubeEtcd` over HTTP on 2381. Metrics are exposed through kubeadm configuration (see kubeadm configuration). `kubeProxy` is disabled because the cluster has no kube-proxy.
@@ -463,6 +502,14 @@ Key `values.yaml` settings:
 Access: add `192.168.64.55 grafana.lab.local prometheus.lab.local` to `/etc/hosts` on the Mac, then open `https://grafana.lab.local:30971` (username `admin`) and `https://prometheus.lab.local:30971`. The Prometheus UI has no authentication; restrict access in production. **Status → Targets** should show `UP` for apiserver, kubelet (including cadvisor), kube-state-metrics, node-exporter, and coredns.
 
 Useful Prometheus query for memory usage by namespace: `sum by (namespace) (container_memory_working_set_bytes{container!=""})`.
+
+### Moving Grafana to the worker
+
+Grafana was stopped through `replicas: 0` in Git. After ArgoCD synced and the pod disappeared, its data was archived. The old PV, `pvc-ad02317a-3577-45d3-bcc9-805e5fdfc2c3`, was changed to `Retain`. The archive was transferred to the worker over SSH and its SHA-256 matched. Restored data occupied 55 MB, with owner `472:472`; directory permissions were restricted to `0750`.
+
+Once the new PV/PVC were `Bound`, values were updated with `existingClaim`, worker placement, and `replicas: 1`. Grafana became `3/3 Running`; UI operation and data preservation were confirmed. Archives at `/var/backups/grafana-migration/grafana-data.tar.gz` on both nodes and the original control-plane data remain available for rollback. ArgoCD may have pruned the old PVC; the old PV's `Retain` policy preserves its data directory.
+
+For a fresh installation, create the worker directory first and assign ownership to `472:472`; the static PV manifest does not create the directory or restore data. For future Grafana updates, account for `ReadWriteOnce`: stop the pod during storage migration or maintenance; use the `Recreate` strategy to avoid two pods writing to the volume during updates.
 
 ## Network observability (Hubble)
 
@@ -653,7 +700,7 @@ For easier future moves, configure a DHCP reservation or static IP for the VM.
 - **Cilium under ArgoCD**: apply the Application (`bootstrap/cilium.yaml`) manually, just like ApplicationSet. `prune: false` prevents automatic deletion of CNI resources. To upgrade the chart, change `targetRevision` in the Application manifest and rerun `kubectl apply -f bootstrap/cilium.yaml`.
 - **Control-plane metrics** are exposed on the node IP. Controller-manager and scheduler require a token authorized for `/metrics` (Prometheus has one); etcd metrics use unauthenticated HTTP. This is acceptable in the lab; restrict these ports with network policies or a firewall in production.
 - **Node IP** is not reserved for the VM and changes when moved to another host. Configure a DHCP reservation or static address; see Changing a node IP for recovery steps.
-- **`local-path` data** is tied to the control-plane and cannot move. If that node is lost, Vault, Prometheus, and Grafana cannot start on the worker. Actual high availability requires replicated storage (Longhorn, Rook-Ceph, or NFS) and recovery from snapshots.
+- **Local volumes** are tied to nodes: Vault and Prometheus to the control-plane, Grafana to the worker. Data does not move automatically between nodes; volume backups or storage with suitable fault tolerance are needed.
 - **Worker firewall**: `allowed_v4` in table `ansible_nodeport` still includes `10.244.0.0/16` from the previous Calico cluster; Cilium does not need it. When recreating the worker VM, restore `ufw` rules and the subnet in that table, otherwise `exec`/`logs` and NodePort fail.
 - **containerd versions** differ between nodes (control-plane 2.3.6, worker 2.4.2): align them and pin with `apt-mark hold containerd.io`.
 - **`--pod-network-cidr=10.244.0.0/16`** is a leftover flannel default. Cilium does not require it: it uses its own IPAM (`cluster-pool`) unless explicitly overridden during `cilium install`.
