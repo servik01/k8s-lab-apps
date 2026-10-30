@@ -12,8 +12,7 @@ kube-prometheus-stack:
       passwordKey: admin-password
     persistence:
       enabled: true
-      storageClassName: local-path
-      size: 1Gi
+      existingClaim: grafana-worker-data
     ingress:
       enabled: true
       ingressClassName: nginx
