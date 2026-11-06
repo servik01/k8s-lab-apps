@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: linkerd-webhooks
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/servik01/k8s-lab-apps.git
+    targetRevision: HEAD
+    path: platform/linkerd-webhooks
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: linkerd
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

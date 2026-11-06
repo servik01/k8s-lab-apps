@@ -1,0 +1,101 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: linkerd-webhook-selfsigned
+  namespace: linkerd
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: linkerd-webhook-ca
+  namespace: linkerd
+spec:
+  secretName: linkerd-webhook-ca
+  isCA: true
+  commonName: linkerd-webhook-ca
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: linkerd-webhook-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: linkerd-webhook-issuer
+  namespace: linkerd
+spec:
+  ca:
+    secretName: linkerd-webhook-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: linkerd-proxy-injector
+  namespace: linkerd
+spec:
+  secretName: linkerd-proxy-injector-k8s-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - linkerd-proxy-injector.linkerd.svc
+    - linkerd-proxy-injector.linkerd.svc.cluster.local
+  usages:
+    - server auth
+  issuerRef:
+    name: linkerd-webhook-issuer
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: linkerd-sp-validator
+  namespace: linkerd
+spec:
+  secretName: linkerd-sp-validator-k8s-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - linkerd-sp-validator.linkerd.svc
+    - linkerd-sp-validator.linkerd.svc.cluster.local
+  usages:
+    - server auth
+  issuerRef:
+    name: linkerd-webhook-issuer
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: linkerd-policy-validator
+  namespace: linkerd
+spec:
+  secretName: linkerd-policy-validator-k8s-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - linkerd-policy-validator.linkerd.svc
+    - linkerd-policy-validator.linkerd.svc.cluster.local
+  usages:
+    - server auth
+  issuerRef:
+    name: linkerd-webhook-issuer
+    kind: Issuer
