@@ -15,7 +15,7 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (прописа�
 
 Кластер из двух нод. На control-plane стоит штатный taint `node-role.kubernetes.io/control-plane:NoSchedule`, обычные нагрузки планируются на worker. Vault и Prometheus остаются на control-plane: их `local-path`-тома привязаны к этой ноде, поэтому в values заданы tolerations (`workloads/vault`: `server.tolerations` строкой; `workloads/monitoring`: `prometheus.prometheusSpec.tolerations`). StatefulSet Vault обновляется по `OnDelete`: после изменения шаблона под пересоздаётся вручную и требует unseal.
 
-ArgoCD и Grafana перенесены на worker для разгрузки control-plane. Grafana использует отдельный статический local PV/PVC `grafana-worker-data`, данные скопированы с сохранением владельцев и прав. Память control-plane уменьшена с 8 до 6 GB; после перезапуска обе ноды `Ready`, все девять Application `Synced / Healthy`. Последний замер: control-plane 2925 MiB (50%), worker 2166 MiB (56%); это наблюдение после загрузки, а не гарантия пикового потребления.
+ArgoCD и Grafana перенесены на worker для разгрузки control-plane. Grafana использует отдельный статический local PV/PVC `grafana-worker-data`, данные скопированы с сохранением владельцев и прав. Память control-plane уменьшена с 8 до 6 GB; после перезапуска обе ноды `Ready`, все девять существовавших на тот момент Application `Synced / Healthy`. Последний замер: control-plane 2925 MiB (50%), worker 2166 MiB (56%); это наблюдение после загрузки, а не гарантия пикового потребления.
 
 Файрвол на worker (`ufw`, `default deny incoming`): остались только SSH (22) и весь трафик с control-plane (`sudo ufw allow from 192.168.64.55`). Без второго правила control-plane не достаёт до kubelet (порт 10250), и `kubectl exec`/`logs` для подов на worker падают с `i/o timeout`. Правила под Calico (BGP, VXLAN, Typha, `10.244.0.0/16`) удалены: Cilium ходит между нодами по трафику, разрешённому правилом для control-plane. Отдельно на worker загружается таблица nftables `ansible_nodeport` (`/etc/nftables.d/ansible-nodeport.nft`, юнит `ansible-nodeport-firewall.service`): она пропускает NodePort (30000–32767) только из перечисленных подсетей, в их число добавлена `192.168.64.0/24`, иначе доступ с Mac к ingress-nginx ломается, когда он оказывается на worker. На control-plane `ufw` не установлен.
 
@@ -36,6 +36,8 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 | Мониторинг       | kube-prometheus-stack 91.9.0 (Prometheus, Grafana; Alertmanager выключен), данные на PVC |
 | Сеть, наблюдаемость | Hubble (relay + UI), метрики Cilium в Prometheus |
 | Тестовые приложения | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch образы под arm64) |
+| База данных | PostgreSQL `postgres:17-bookworm` (проверена 17.11, arm64), StatefulSet, PVC 2Gi на worker |
+| Service mesh | Linkerd `edge-26.11.1`, Helm-чарты `2026.11.1`, Gateway API CRD `v1.5.1`; ingress остаётся ingress-nginx |
 
 ## Подготовка ОС (все ноды)
 
@@ -258,6 +260,8 @@ k8s-lab-apps/
     └── whoami/               # deployment, service, ingress
 ```
 
+Новые компоненты: `workloads/postgres/` (StatefulSet и Services), `workloads/mesh-demo/` (клиент и HTTP-сервер с Linkerd). Конфигурация mesh лежит в `platform/linkerd/` и `platform/linkerd-webhooks/`; отдельные Application — `bootstrap/linkerd-crds.yaml`, `bootstrap/linkerd-webhooks.yaml`, `bootstrap/linkerd.yaml`. Они применяются вручную, вне генератора `workloads/*`.
+
 ### ApplicationSet
 
 Git directory generator превращает каждую папку `workloads/*` в Application: имя Application и namespace берутся из имени папки. Включены `automated` sync, `prune`, `selfHeal` и `CreateNamespace=true`, на каждом Application стоит finalizer `resources-finalizer.argocd.argoproj.io`.
@@ -422,6 +426,86 @@ KUBECONFIG=/dev/null kubectl --server=https://k8s-api.lab.local:6443 \
 ```
 
 **`workloads/netpol-demo`**: `web` (nginx) и `client` с меткой `role=client`. Политики: `default-deny-ingress`, `allow-client-to-web` и `client-egress` (только `web:80` и DNS в `kube-system`). Блокировка проявляется как **таймаут**, а не как отказ в соединении; при проблемах с DNS вместо таймаута будет `bad address`. Важно: `default-deny-ingress` в namespace с ingress-nginx сломает доступ извне, если не разрешить трафик из namespace `ingress-nginx`.
+
+## PostgreSQL (StatefulSet)
+
+`workloads/postgres/` обнаруживается ApplicationSet как Application `postgres` в одноимённом namespace. Одна реплика `postgres-0` работает на `k8s-worker`, образ `postgres:17-bookworm` (при проверке — 17.11 на arm64). Requests: 100m CPU / 256Mi, limit памяти 512Mi; startup/readiness probes используют `pg_isready`. Тег фиксирует major, но не minor или digest; смена major требует миграции данных, простая замена тега не является обновлением базы.
+
+- Headless Service `postgres-headless` задаёт сетевую идентичность StatefulSet.
+- ClusterIP Service `postgres`: `postgres.postgres.svc.cluster.local:5432`; база `lab`, администратор `postgres`.
+- `volumeClaimTemplates` создаёт PVC `data-postgres-0`, 2Gi, RWO, StorageClass `local-path` с `WaitForFirstConsumer`. `PGDATA=/var/lib/postgresql/data/pgdata`.
+- `persistentVolumeClaimRetentionPolicy` сохраняет PVC при удалении StatefulSet и масштабировании вниз. Ручное удаление PVC при политике PV `Delete` удаляет данные. Том привязан к worker; одна реплика не обеспечивает HA, увеличение replicas само не настраивает репликацию PostgreSQL.
+
+Перед первым sync вручную создаются namespace и Secret `postgres-auth` с ключом `POSTGRES_PASSWORD`, вне Git. Пример генерации без вывода пароля:
+
+```bash
+kubectl create namespace postgres
+(
+  set -eu
+  umask 077
+  secret_file=$(mktemp)
+  trap 'rm -f "$secret_file"' EXIT
+  openssl rand -hex 24 | tr -d '\n' > "$secret_file"
+  kubectl -n postgres create secret generic postgres-auth \
+    --from-file=POSTGRES_PASSWORD="$secret_file"
+)
+```
+
+Переменные `POSTGRES_*` инициализируют только пустой каталог данных. Изменение Secret после инициализации не меняет пароль внутри PostgreSQL. Secret и резервные копии данных не публикуются.
+
+Проверены вход по TCP через Service с паролем и сохранность записи `public.persistence_check` после удаления пода: StatefulSet вернул `postgres-0` с новым IP и прежним PVC, запись сохранилась.
+
+```bash
+kubectl -n postgres get pods,pvc,svc -o wide
+kubectl -n postgres exec postgres-0 -- \
+  psql -U postgres -d lab -c 'SELECT * FROM public.persistence_check;'
+```
+
+### Ограниченный пользователь
+
+В работающей базе вручную создан `lab_app` с `LOGIN`, `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, `NOBYPASSRLS`. Ему выдан `CONNECT` к `lab`, создана схема `app` с владельцем `lab_app`, `search_path` для этой базы задан `app`. Пароль установлен интерактивно через `\password lab_app`; он не входит в Git и не совпадает с обязательной настройкой Secret администратора.
+
+Проверено: пользователь входит через TCP с паролем, создаёт таблицы и изменяет свои данные в `app`, но получает `permission denied` при чтении `public.persistence_check`, принадлежащей администратору. Тестовая таблица отменена через `ROLLBACK`. Это пользователь-владелец своей схемы, а не роль только для чтения; общие права `PUBLIC` отдельно не ужесточались. Роль хранится в самой базе и не создаётся манифестами при установке с нуля. Бэкапы PostgreSQL пока не настроены; снимки etcd не включают данные PVC.
+
+## Linkerd (service mesh)
+
+Установлен Linkerd `edge-26.11.1` (Linux ARM64 CLI, Helm-чарты `2026.11.1`). Control plane на ноде `kubernetes`, по одной реплике, с toleration control-plane: `linkerd-destination` (4/4), `linkerd-identity` (2/2), `linkerd-proxy-injector` (2/2). Linkerd Viz и дополнительный Prometheus не устанавливались.
+
+### Cilium и Gateway API
+
+В `platform/cilium/values.yaml` задано `socketLB.hostNamespaceOnly: true`, `kubeProxyReplacement: true` сохранён. После синхронизации агенты Cilium перезапущены по одному; оба подтвердили `Socket LB Coverage: Hostns-only`, health показал успешные host/endpoint проверки обеих нод. Это позволяет прокси Linkerd перехватывать трафик до балансировки Service в pod namespace.
+
+Gateway API CRD `v1.5.1` установлены вручную через server-side apply стандартного bundle. Они нужны Linkerd для маршрутов и политик; ingress-nginx и существующие Ingress не заменялись. Experimental `TCPRoute` не установлен; предупреждение policy-controller о пропуске watch этого типа не помешало успешной проверке.
+
+### Сертификаты и GitOps
+
+- Корневой CA и issuer mTLS с ECDSA P-256 созданы вручную в `~/linkerd-pki` на control-plane. Корневой сертификат действует примерно десять лет, issuer — до **6 ноября 2027, 13:24:20 UTC**. Автоматическая ротация issuer не настроена.
+- Namespace `linkerd` и Secret `linkerd-identity-issuer` созданы до установки. Secret типа `kubernetes.io/tls` содержит `tls.crt`, `tls.key`, `ca.crt`; `identity.issuer.scheme: kubernetes.io/tls` использует готовый Secret. Корневой приватный ключ в кластер не передавался. В Git хранится только публичный CA в `platform/linkerd/values.yaml`; приватные ключи необходимо сохранять вне Git.
+- Для webhook используется отдельная цепочка cert-manager: два Issuer, Certificate CA и три серверных Certificate из `platform/linkerd-webhooks/certificates.yaml`. Серверные сертификаты действуют 90 дней, обновление начинается за 30 дней до истечения; `externalSecret` и `injectCaFrom` исключают случайную генерацию при рендере Helm. Ротация всей цепочки CA требует отдельного планирования.
+- Три серверных ключа явно используют `encoding: PKCS8`, usages `digital signature` и `server auth`. Без PKCS8 контейнер `policy` завершался с `failed to read TLS key: could not load private key`; после перевыпуска восстановился автоматически.
+- Bootstrap Application `linkerd-crds`, `linkerd-webhooks`, `linkerd` не имеют finalizer, используют `selfHeal: true`, `prune: false`. У `linkerd` два источника (чарт и Git values); `caBundle` Mutating/ValidatingWebhookConfiguration исключён из сравнения с `RespectIgnoreDifferences=true`, его заполняет cert-manager.
+
+На чистом кластере сначала нужны Gateway API CRD, namespace и issuer Secret с сертификатами, затем `bootstrap/linkerd-crds.yaml`, `bootstrap/linkerd-webhooks.yaml` (дождаться Ready всех Certificate), затем `bootstrap/linkerd.yaml`. Публичный trust anchor в Git должен соответствовать issuer Secret: восстановление только манифестов без ключей недостаточно. `workloads/mesh-demo` следует синхронизировать после готовности control plane, иначе при `failurePolicy: Ignore` поды могут создаться без прокси.
+
+### Проверка mesh и mTLS
+
+`workloads/mesh-demo/`: Deployments `client` (busybox) и `web` (nginx), Service `web`, namespace `mesh-demo`. Оба на worker; injection включён аннотацией `linkerd.io/inject: enabled` только на шаблонах этих подов. Прокси requests: 10m CPU / 32Mi. Остальные приложения в mesh не включены.
+
+Клиент делает `http://web` каждые пять секунд. Оба пода стали `2/2 Running`, Application — `Synced / Healthy`, в логе `HTTP request OK`. Успешны `linkerd check` и `linkerd check --proxy --namespace mesh-demo`, включая проверку сертификатов прокси.
+
+```bash
+linkerd check
+linkerd check --proxy --namespace mesh-demo
+kubectl -n mesh-demo logs deployment/client -c client --tail=10
+linkerd diagnostics proxy-metrics -n mesh-demo deploy/web \
+  > /tmp/mesh-web-proxy-metrics.txt
+linkerd diagnostics proxy-metrics -n mesh-demo deploy/client \
+  > /tmp/mesh-client-proxy-metrics.txt
+grep '^request_total' /tmp/mesh-web-proxy-metrics.txt | grep 'tls="true"'
+grep '^request_total' /tmp/mesh-client-proxy-metrics.txt | grep 'tls="true"'
+```
+
+mTLS подтверждён: серверные метрики показывают `tls="true"` и `client_id`, клиентские — `tls="true"` и `server_id`. Идентичность обоих — `default.mesh-demo.serviceaccount.identity.linkerd.cluster.local`, поскольку используется общий ServiceAccount `default`. Приложения говорят по HTTP, защищено соединение между прокси. Политика пока `all-unauthenticated`: mTLS наблюдаемого трафика не означает запрета незашифрованным клиентам. Отдельные ServiceAccount и обязательная авторизация ещё не настроены.
 
 ## Эксплуатация: после перезагрузки VM
 
@@ -688,11 +772,13 @@ sudo kubeadm init phase upload-config kubeadm --config platform/kubeadm/config.y
 
 ## Известные моменты / TODO
 
+- **Linkerd**: обновить issuer mTLS до 6 ноября 2027 года, сохранить ключи вне Git, зафиксировать установку Gateway API CRD декларативно. Следующая практика — отдельные ServiceAccount и авторизация в `mesh-demo`; Viz пока не установлен.
+- **PostgreSQL**: настроить и проверить резервное копирование данных и ролей; текущий local PV не защищает от потери worker.
 - **Vault**: после каждого перезапуска пода нужен ручный unseal (auto-unseal: transit или облачный KMS). Состояние OpenTofu лежит локально на VM: кандидат на удалённый backend. Для провайдера используется root token, лучше отдельный токен с узкой политикой.
 - **Cilium под ArgoCD**: Application (`bootstrap/cilium.yaml`) применяется вручную, как и ApplicationSet. `prune: false`, чтобы Argo не удалял ресурсы CNI сам. Версия чарта обновляется правкой `targetRevision` в манифесте Application и повторным `kubectl apply -f bootstrap/cilium.yaml`.
 - **Метрики control-plane** открыты на адресе ноды: controller-manager и scheduler требуют токен с правом на `/metrics` (у Prometheus он есть), а метрики etcd идут по HTTP без аутентификации. Для лабы это приемлемо, на проде такие порты закрывают сетевыми политиками или файрволом.
 - **IP ноды** не закреплён за VM (меняется при переносе на другой хост): настроить DHCP-резервацию или статический адрес; порядок действий при смене IP — раздел «Смена IP ноды».
-- **Локальные тома** привязаны к нодам: Vault и Prometheus — к control-plane, Grafana — к worker. Автоматического переноса данных между ними нет; нужны бэкапы томов или хранилище с подходящей отказоустойчивостью.
+- **Локальные тома** привязаны к нодам: Vault и Prometheus — к control-plane, Grafana и PostgreSQL — к worker. Автоматического переноса данных между ними нет; нужны бэкапы томов или хранилище с подходящей отказоустойчивостью.
 - **Файрвол worker**: в `allowed_v4` таблицы `ansible_nodeport` по-прежнему стоит `10.244.0.0/16` от прежнего кластера на Calico, для Cilium он не нужен. При пересоздании worker-VM нужно заново выставить правила `ufw` и подсеть в таблице, иначе будут падать `exec`/`logs` и NodePort.
 - **Версия containerd** на нодах разная (control-plane 2.3.6, worker 2.4.2): выровнять и закрепить `apt-mark hold containerd.io`.
 - **`--pod-network-cidr=10.244.0.0/16`** указан по инерции (дефолт для flannel); для Cilium не обязателен — используется его собственный IPAM (`cluster-pool`), если явно не переопределить при `cilium install`.

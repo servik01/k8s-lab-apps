@@ -15,7 +15,7 @@ Control-plane endpoint: `k8s-api.lab.local` → `192.168.64.55` (configured in `
 
 The cluster has two nodes. The control-plane has the standard `node-role.kubernetes.io/control-plane:NoSchedule` taint, so regular workloads run on the worker. Vault and Prometheus remain on the control-plane: their `local-path` volumes are tied to that node, so values include tolerations (`workloads/vault`: `server.tolerations` as a string; `workloads/monitoring`: `prometheus.prometheusSpec.tolerations`). Vault's StatefulSet uses `OnDelete`: after changing its template, manually recreate the pod and unseal it.
 
-ArgoCD and Grafana have moved to the worker to reduce control-plane memory usage. Grafana uses a separate static local PV/PVC, `grafana-worker-data`; its data was copied with ownership and permissions preserved. Control-plane RAM was reduced from 8 to 6 GB. After reboot, both nodes were `Ready` and all nine Applications were `Synced / Healthy`. The latest reading was 2925 MiB (50%) on the control-plane and 2166 MiB (56%) on the worker; this is a post-boot observation, not a peak usage guarantee.
+ArgoCD and Grafana have moved to the worker to reduce control-plane memory usage. Grafana uses a separate static local PV/PVC, `grafana-worker-data`; its data was copied with ownership and permissions preserved. Control-plane RAM was reduced from 8 to 6 GB. After reboot, both nodes were `Ready` and all nine Applications present at that time were `Synced / Healthy`. The latest reading was 2925 MiB (50%) on the control-plane and 2166 MiB (56%) on the worker; this is a post-boot observation, not a peak usage guarantee.
 
 The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and all traffic from the control-plane (`sudo ufw allow from 192.168.64.55`). Without the latter rule, the control-plane cannot reach kubelet (port 10250), and `kubectl exec`/`logs` for worker pods fail with `i/o timeout`. Calico rules (BGP, VXLAN, Typha, `10.244.0.0/16`) have been removed: Cilium's traffic between these nodes is covered by the control-plane rule. The worker also loads the nftables table `ansible_nodeport` (`/etc/nftables.d/ansible-nodeport.nft`, unit `ansible-nodeport-firewall.service`). It permits NodePort traffic (30000–32767) only from listed subnets; `192.168.64.0/24` was added so the Mac can access ingress-nginx when it runs on the worker. The control-plane does not have `ufw` installed.
 
@@ -36,6 +36,8 @@ The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and al
 | Monitoring | kube-prometheus-stack 91.9.0 (Prometheus, Grafana; Alertmanager disabled), data on PVCs |
 | Network observability | Hubble (relay + UI), Cilium metrics in Prometheus |
 | Demo applications | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch images supporting arm64) |
+| Database | PostgreSQL `postgres:17-bookworm` (verified 17.11, arm64), StatefulSet, 2Gi PVC on worker |
+| Service mesh | Linkerd `edge-26.11.1`, Helm charts `2026.11.1`, Gateway API CRDs `v1.5.1`; ingress remains ingress-nginx |
 
 ## OS preparation (all nodes)
 
@@ -258,6 +260,8 @@ k8s-lab-apps/
     └── whoami/               # deployment, service, ingress
 ```
 
+Additional components: `workloads/postgres/` (StatefulSet and Services), `workloads/mesh-demo/` (Linkerd-enabled client and HTTP server). Mesh configuration lives in `platform/linkerd/` and `platform/linkerd-webhooks/`; dedicated Applications are `bootstrap/linkerd-crds.yaml`, `bootstrap/linkerd-webhooks.yaml`, and `bootstrap/linkerd.yaml`. These are applied manually, outside the `workloads/*` generator.
+
 ### ApplicationSet
 
 The Git directory generator turns every `workloads/*` directory into an Application. The directory name becomes both the Application name and its namespace. `automated` sync, `prune`, `selfHeal`, and `CreateNamespace=true` are enabled. Each Application has the `resources-finalizer.argocd.argoproj.io` finalizer.
@@ -423,6 +427,86 @@ KUBECONFIG=/dev/null kubectl --server=https://k8s-api.lab.local:6443 \
 
 **`workloads/netpol-demo`**: `web` (nginx) and `client` labeled `role=client`. Policies: `default-deny-ingress`, `allow-client-to-web`, and `client-egress` (only `web:80` and DNS in `kube-system`). Blocked traffic results in a **timeout**, rather than connection refusal; DNS issues produce `bad address` instead. Applying `default-deny-ingress` in a namespace served by ingress-nginx breaks external access unless traffic from namespace `ingress-nginx` is allowed.
 
+## PostgreSQL (StatefulSet)
+
+`workloads/postgres/` is discovered by ApplicationSet as Application `postgres` in namespace `postgres`. One replica, `postgres-0`, runs on `k8s-worker` using `postgres:17-bookworm` (verified as 17.11 on arm64). Requests: 100m CPU / 256Mi; memory limit: 512Mi. Startup/readiness probes use `pg_isready`. The image tag pins the major version, not a minor or digest; a major upgrade requires data migration, not simply changing the tag.
+
+- Headless Service `postgres-headless` provides StatefulSet network identity.
+- ClusterIP Service `postgres`: `postgres.postgres.svc.cluster.local:5432`; database `lab`, administrator `postgres`.
+- `volumeClaimTemplates` creates PVC `data-postgres-0`: 2Gi, RWO, `local-path` with `WaitForFirstConsumer`. `PGDATA=/var/lib/postgresql/data/pgdata`.
+- `persistentVolumeClaimRetentionPolicy` retains PVCs on StatefulSet deletion and scale-down. Manually deleting the PVC with PV policy `Delete` deletes the data. The volume is tied to the worker; one replica is not HA, and increasing replicas does not configure PostgreSQL replication.
+
+Before the first sync, manually create the namespace and Secret `postgres-auth` with key `POSTGRES_PASSWORD`, outside Git. Generate a password without displaying it:
+
+```bash
+kubectl create namespace postgres
+(
+  set -eu
+  umask 077
+  secret_file=$(mktemp)
+  trap 'rm -f "$secret_file"' EXIT
+  openssl rand -hex 24 | tr -d '\n' > "$secret_file"
+  kubectl -n postgres create secret generic postgres-auth \
+    --from-file=POSTGRES_PASSWORD="$secret_file"
+)
+```
+
+`POSTGRES_*` variables initialize only an empty data directory. Changing the Secret after initialization does not change the database password. Keep the Secret and data backups out of Git.
+
+TCP access through the Service with a password was verified. A record in `public.persistence_check` survived pod deletion: StatefulSet recreated `postgres-0` with a new IP and the same PVC, preserving the record.
+
+```bash
+kubectl -n postgres get pods,pvc,svc -o wide
+kubectl -n postgres exec postgres-0 -- \
+  psql -U postgres -d lab -c 'SELECT * FROM public.persistence_check;'
+```
+
+### Limited user
+
+Role `lab_app` was created manually with `LOGIN`, `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, and `NOBYPASSRLS`. It was granted `CONNECT` to `lab`, ownership of schema `app`, and a database-specific `search_path` of `app`. Its separate password was set interactively with `\password lab_app`; it is not stored in Git or configured by the administrator Secret.
+
+Verified: password-based TCP login, creating tables and changing its own data in `app`, and `permission denied` when reading administrator-owned `public.persistence_check`. The test table was rolled back. This user owns its schema and is not read-only; shared `PUBLIC` privileges were not separately hardened. The role lives in the database and is not recreated by manifests on a fresh installation. PostgreSQL backups are not configured; etcd snapshots do not include PVC data.
+
+## Linkerd (service mesh)
+
+Installed Linkerd `edge-26.11.1` (Linux ARM64 CLI, Helm charts `2026.11.1`). Its control plane runs on node `kubernetes`, one replica per component, with a control-plane toleration: `linkerd-destination` (4/4), `linkerd-identity` (2/2), and `linkerd-proxy-injector` (2/2). Linkerd Viz and an additional Prometheus were not installed.
+
+### Cilium and Gateway API
+
+`platform/cilium/values.yaml` sets `socketLB.hostNamespaceOnly: true` while retaining `kubeProxyReplacement: true`. Following sync, Cilium agents were restarted one at a time; both reported `Socket LB Coverage: Hostns-only`, and health checks passed for hosts and endpoints on both nodes. This allows Linkerd proxies to intercept traffic before Service load balancing within pod namespaces.
+
+Gateway API CRDs `v1.5.1` were manually installed using server-side apply of the standard bundle. Linkerd uses them for routing and policies; ingress-nginx and existing Ingress resources remain in place. Experimental `TCPRoute` was not installed; the policy-controller warning about skipping its watch did not prevent successful checks.
+
+### Certificates and GitOps
+
+- An ECDSA P-256 mTLS root CA and issuer were generated manually in `~/linkerd-pki` on the control-plane. The root lasts about ten years; the issuer expires on **6 November 2027 at 13:24:20 UTC**. Automatic issuer rotation is not configured.
+- Namespace `linkerd` and Secret `linkerd-identity-issuer` were created before installation. The `kubernetes.io/tls` Secret contains `tls.crt`, `tls.key`, and `ca.crt`; `identity.issuer.scheme: kubernetes.io/tls` uses this existing Secret. The root private key was not uploaded to the cluster. Only the public CA is stored in `platform/linkerd/values.yaml`; preserve private keys outside Git.
+- Webhooks use a separate cert-manager chain: two Issuers, a CA Certificate, and three server Certificates in `platform/linkerd-webhooks/certificates.yaml`. Server certificates last 90 days and renew 30 days before expiry; `externalSecret` and `injectCaFrom` prevent random certificate generation during Helm rendering. Full CA-chain rotation requires separate planning.
+- All three server keys explicitly use `encoding: PKCS8` with usages `digital signature` and `server auth`. Without PKCS8, container `policy` exited with `failed to read TLS key: could not load private key`; it recovered automatically after reissuance.
+- Bootstrap Applications `linkerd-crds`, `linkerd-webhooks`, and `linkerd` have no finalizer and use `selfHeal: true`, `prune: false`. `linkerd` has two sources (chart and Git values); Mutating/ValidatingWebhookConfiguration `caBundle` is excluded from comparison with `RespectIgnoreDifferences=true` because cert-manager populates it.
+
+On a fresh cluster, first install Gateway API CRDs and create the namespace and issuer Secret with certificates. Apply `bootstrap/linkerd-crds.yaml`, then `bootstrap/linkerd-webhooks.yaml` (wait for all Certificates to become Ready), then `bootstrap/linkerd.yaml`. The public trust anchor in Git must match the issuer Secret: restoring manifests alone without keys is insufficient. Sync `workloads/mesh-demo` after the control plane is ready; otherwise `failurePolicy: Ignore` may allow pods to start without proxies.
+
+### Mesh and mTLS verification
+
+`workloads/mesh-demo/` contains Deployments `client` (busybox) and `web` (nginx) and Service `web` in namespace `mesh-demo`. Both run on the worker. Injection is enabled through `linkerd.io/inject: enabled` only on these pod templates. Proxy requests: 10m CPU / 32Mi. Other applications are not meshed.
+
+The client requests `http://web` every five seconds. Both pods became `2/2 Running`, the Application was `Synced / Healthy`, and logs showed `HTTP request OK`. Both `linkerd check` and `linkerd check --proxy --namespace mesh-demo` passed, including proxy certificate checks.
+
+```bash
+linkerd check
+linkerd check --proxy --namespace mesh-demo
+kubectl -n mesh-demo logs deployment/client -c client --tail=10
+linkerd diagnostics proxy-metrics -n mesh-demo deploy/web \
+  > /tmp/mesh-web-proxy-metrics.txt
+linkerd diagnostics proxy-metrics -n mesh-demo deploy/client \
+  > /tmp/mesh-client-proxy-metrics.txt
+grep '^request_total' /tmp/mesh-web-proxy-metrics.txt | grep 'tls="true"'
+grep '^request_total' /tmp/mesh-client-proxy-metrics.txt | grep 'tls="true"'
+```
+
+mTLS was confirmed: server metrics show `tls="true"` and `client_id`, while client metrics show `tls="true"` and `server_id`. Both identities are `default.mesh-demo.serviceaccount.identity.linkerd.cluster.local` because they share ServiceAccount `default`. Applications use HTTP; the proxy-to-proxy connection is secured. Policy remains `all-unauthenticated`: observing mTLS does not mean unencrypted clients are denied. Dedicated ServiceAccounts and mandatory authorization are not configured yet.
+
 ## Operations: after a VM reboot
 
 Maintain nodes one at a time. While the control-plane is off, the API, Vault, and Prometheus are unavailable; the worker can remain running. After setting control-plane RAM to 6144 MiB, the VM was started, Vault unsealed, and applications checked. Restarting only the worker does not require unsealing Vault unless `vault-0` also restarted. Check `/proc/swaps` on both nodes.
@@ -468,7 +552,7 @@ kubectl uncordon k8s-worker
 
 These maintenance exercise commands cause application downtime; `--delete-emptydir-data` permits deletion of temporary `emptyDir` data. Drain waits for old pods to be deleted, not for replacements to become ready. After `uncordon`, pending pods started automatically, all Applications returned to `Synced / Healthy`, and nginx and whoami returned HTTP 200 through the control-plane NodePort.
 
-The exercise preceded the move of ArgoCD and Grafana to the worker. Draining now affects them too, and Grafana's local volume ties it to the worker. Two replicas on a single eligible node do not protect against maintenance of that node. No PDB has been added yet.
+The exercise preceded the move of ArgoCD and Grafana and PostgreSQL to the worker. Draining now affects them too, and Grafana's local volume ties it to the worker. Two replicas on a single eligible node do not protect against maintenance of that node. No PDB has been added yet.
 
 ## Monitoring (kube-prometheus-stack)
 
@@ -696,11 +780,13 @@ For easier future moves, configure a DHCP reservation or static IP for the VM.
 
 ## Known issues / TODO
 
+- **Linkerd**: renew the mTLS issuer before 6 November 2027, preserve keys outside Git, and capture Gateway API CRD installation declaratively. Next exercise: dedicated ServiceAccounts and authorization in `mesh-demo`; Viz is not installed.
+- **PostgreSQL**: configure and test backups of data and roles; the local PV does not protect against worker loss.
 - **Vault**: manual unseal is required after every pod restart (auto-unseal options: transit or cloud KMS). OpenTofu state is local to the VM and could move to a remote backend. The provider uses the root token; replace it with a dedicated token with a narrow policy.
 - **Cilium under ArgoCD**: apply the Application (`bootstrap/cilium.yaml`) manually, just like ApplicationSet. `prune: false` prevents automatic deletion of CNI resources. To upgrade the chart, change `targetRevision` in the Application manifest and rerun `kubectl apply -f bootstrap/cilium.yaml`.
 - **Control-plane metrics** are exposed on the node IP. Controller-manager and scheduler require a token authorized for `/metrics` (Prometheus has one); etcd metrics use unauthenticated HTTP. This is acceptable in the lab; restrict these ports with network policies or a firewall in production.
 - **Node IP** is not reserved for the VM and changes when moved to another host. Configure a DHCP reservation or static address; see Changing a node IP for recovery steps.
-- **Local volumes** are tied to nodes: Vault and Prometheus to the control-plane, Grafana to the worker. Data does not move automatically between nodes; volume backups or storage with suitable fault tolerance are needed.
+- **Local volumes** are tied to nodes: Vault and Prometheus to the control-plane, Grafana and PostgreSQL to the worker. Data does not move automatically between nodes; volume backups or storage with suitable fault tolerance are needed.
 - **Worker firewall**: `allowed_v4` in table `ansible_nodeport` still includes `10.244.0.0/16` from the previous Calico cluster; Cilium does not need it. When recreating the worker VM, restore `ufw` rules and the subnet in that table, otherwise `exec`/`logs` and NodePort fail.
 - **containerd versions** differ between nodes (control-plane 2.3.6, worker 2.4.2): align them and pin with `apt-mark hold containerd.io`.
 - **`--pod-network-cidr=10.244.0.0/16`** is a leftover flannel default. Cilium does not require it: it uses its own IPAM (`cluster-pool`) unless explicitly overridden during `cilium install`.
