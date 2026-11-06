@@ -1,0 +1,40 @@
+controllerReplicas: 1
+
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/hostname: kubernetes
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+identity:
+  issuer:
+    scheme: kubernetes.io/tls
+
+proxyInjector:
+  externalSecret: true
+  injectCaFrom: linkerd/linkerd-proxy-injector
+
+profileValidator:
+  externalSecret: true
+  injectCaFrom: linkerd/linkerd-sp-validator
+
+policyValidator:
+  externalSecret: true
+  injectCaFrom: linkerd/linkerd-policy-validator
+
+identityTrustAnchorsPEM: |
+  -----BEGIN CERTIFICATE-----
+  MIIBszCCAVigAwIBAgIUOI4j3UDEqlKTugqAmIwprzP8C/owCgYIKoZIzj0EAwIw
+  JTEjMCEGA1UEAwwacm9vdC5saW5rZXJkLmNsdXN0ZXIubG9jYWwwHhcNMjYxMTA2
+  MTMyNDIwWhcNMzYxMTAzMTMyNDIwWjAlMSMwIQYDVQQDDBpyb290LmxpbmtlcmQu
+  Y2x1c3Rlci5sb2NhbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFc5D7hz81Rh
+  ZqbqyraPdgjBPTOoPntWAYARRFRWjPn2pEp1KUFmNsRyvlCqETTu7+lkgj7ABLCb
+  UznfQQFZFLSjZjBkMB0GA1UdDgQWBBRUQEBr/87kVliZ8LjA9NMN8enW7jAfBgNV
+  HSMEGDAWgBRUQEBr/87kVliZ8LjA9NMN8enW7jASBgNVHRMBAf8ECDAGAQH/AgEB
+  MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNJADBGAiEAhyn2lot+ZEuct1gM
+  ZlQIVLBvUpC97f59gFVeRo/crykCIQCzQ00riMoFWn7RPNrOkwdYjJxID+6v07tv
+  pOTi0SPgbw==
+  -----END CERTIFICATE-----
