@@ -64,6 +64,8 @@ spec:
             - name: data
               mountPath: /var/lib/postgresql/data
   volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
     - metadata:
         name: data
       spec:
