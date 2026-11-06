@@ -51,10 +51,16 @@ spec:
     - linkerd-proxy-injector.linkerd.svc
     - linkerd-proxy-injector.linkerd.svc.cluster.local
   usages:
+    - digital signature
     - server auth
   issuerRef:
     name: linkerd-webhook-issuer
     kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -73,10 +79,16 @@ spec:
     - linkerd-sp-validator.linkerd.svc
     - linkerd-sp-validator.linkerd.svc.cluster.local
   usages:
+    - digital signature
     - server auth
   issuerRef:
     name: linkerd-webhook-issuer
     kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -95,7 +107,13 @@ spec:
     - linkerd-policy-validator.linkerd.svc
     - linkerd-policy-validator.linkerd.svc.cluster.local
   usages:
+    - digital signature
     - server auth
   issuerRef:
     name: linkerd-webhook-issuer
     kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
