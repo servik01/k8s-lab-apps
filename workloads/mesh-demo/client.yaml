@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mesh-client
+  template:
+    metadata:
+      labels:
+        app: mesh-client
+      annotations:
+        linkerd.io/inject: enabled
+        config.linkerd.io/proxy-cpu-request: 10m
+        config.linkerd.io/proxy-memory-request: 32Mi
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k8s-worker
+      containers:
+        - name: client
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                if wget -q -O /dev/null -T 3 http://web; then
+                  echo "$(date -u) HTTP request OK"
+                else
+                  echo "$(date -u) HTTP request FAILED"
+                fi
+                sleep 5
+              done
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
