@@ -164,6 +164,13 @@ kubectl top nodes
 
 > Immediately after rollout, `kubectl top nodes` may report `Metrics API not available`. APIService registration takes 30–60 seconds; this is expected.
 
+After installation, a placement patch pins metrics-server to the control-plane: from the worker it could not reach the local kubelet because of a network restriction. The patch is stored in Git but applied manually (this component is installed outside ArgoCD):
+
+```bash
+kubectl -n kube-system patch deployment metrics-server --type=strategic \
+  --patch-file=platform/metrics-server/placement-patch.yaml
+```
+
 ## ingress-nginx
 
 ```bash
@@ -695,6 +702,8 @@ Preparation included a fresh etcd snapshot and backups of `/etc/kubernetes`, kub
 Sequence: upgrade kubeadm and run `upgrade plan`; on the first control-plane run `kubeadm upgrade apply v1.35.10 --skip-phases=addon/kube-proxy --yes`, then drain, upgrade kubelet/kubectl, restart kubelet, and uncordon. On the worker: upgrade kubeadm, run `kubeadm upgrade node`, drain, upgrade kubelet/kubectl, restart, and uncordon. Drain used `--ignore-daemonsets --delete-emptydir-data` with temporary application downtime. After `vault-0` was recreated, it was unsealed with the existing local key.
 
 Kubeadm upgraded etcd to **3.6.6-0** and CoreDNS to **v1.13.1**. The kube-proxy phase was explicitly skipped and no DaemonSet was created: Cilium continues to handle Services and NodePort. `platform/kubeadm/config.yaml` now specifies v1.35.10; control-plane metrics flags were preserved. After drain, Hubble relay landed on the worker and timed out connecting to `hubble-peer`. Cilium values pin it to the control-plane with a toleration, restoring its previous working placement. `vault-demo` was recreated after the Vault injector became ready to restore its sidecar.
+
+Final checks: both nodes Ready on v1.35.10, all 46 pods Ready, 14 Applications Synced/Healthy, Cilium health 2/2 with Hostns-only, and successful Linkerd checks and TLS metrics. PostgreSQL retained its test record and `lab_app` restrictions; nginx/whoami returned 200 and Grafana returned 302. Metrics-server was also restored to the control-plane using the stored placement patch; `kubectl top` sees both nodes again. Snapshot creation with the new etcd succeeded. Latest reading: worker 2405Mi (63%), control-plane 3269Mi (56%).
 
 ## kubeadm configuration (control-plane metrics)
 

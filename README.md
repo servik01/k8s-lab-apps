@@ -164,6 +164,13 @@ kubectl top nodes
 
 > Сразу после rollout `kubectl top nodes` может отвечать `Metrics API not available` — APIService регистрируется с задержкой 30–60 сек, это не ошибка.
 
+После установки применён патч размещения на control-plane: с worker metrics-server не достигал локального kubelet из-за сетевого ограничения. Патч хранится в Git, но применяется вручную (компонент установлен вне ArgoCD):
+
+```bash
+kubectl -n kube-system patch deployment metrics-server --type=strategic \
+  --patch-file=platform/metrics-server/placement-patch.yaml
+```
+
 ## ingress-nginx
 
 ```bash
@@ -695,6 +702,8 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 Порядок: новый kubeadm и `upgrade plan`; на первой control-plane — `kubeadm upgrade apply v1.35.10 --skip-phases=addon/kube-proxy --yes`; затем drain, обновление kubelet/kubectl, restart kubelet и uncordon. На worker — новый kubeadm, `kubeadm upgrade node`, drain, обновление kubelet/kubectl, restart и uncordon. Drain выполнялся с `--ignore-daemonsets --delete-emptydir-data`, с временной недоступностью приложений. После пересоздания `vault-0` выполнен unseal существующим локальным ключом.
 
 Kubeadm обновил etcd до **3.6.6-0**, CoreDNS до **v1.13.1**. Фаза kube-proxy пропущена явно, DaemonSet не создан: Service и NodePort продолжает обслуживать Cilium. `platform/kubeadm/config.yaml` актуализирован до v1.35.10; флаги метрик control-plane сохранены. После drain Hubble relay оказался на worker и не мог подключиться к `hubble-peer` (таймаут). В values Cilium его размещение закреплено на control-plane с toleration, возвращая прежнюю рабочую топологию. `vault-demo` пересоздан после готовности Vault injector, чтобы вернуть sidecar.
+
+Итоговые проверки: обе ноды Ready на v1.35.10, все 46 подов Ready, 14 Application Synced/Healthy, Cilium health 2/2 и Hostns-only, Linkerd check и TLS-метрики успешны. PostgreSQL сохранил тестовую запись и ограничения `lab_app`; nginx/whoami вернули 200, Grafana — 302. После обновления metrics-server также возвращён на control-plane сохранённым placement-патчем; `kubectl top` снова видит обе ноды. Создание снимка новым etcd проверено успешно. Последний замер: worker 2405Mi (63%), control-plane 3269Mi (56%).
 
 ## Конфигурация kubeadm (метрики control-plane)
 
