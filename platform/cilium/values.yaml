@@ -33,6 +33,12 @@ hubble:
       enabled: true
   relay:
     enabled: true
+    nodeSelector:
+      kubernetes.io/hostname: kubernetes
+    tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
   ui:
     enabled: true
     ingress:

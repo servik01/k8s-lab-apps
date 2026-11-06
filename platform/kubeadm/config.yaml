@@ -27,7 +27,7 @@ etcd:
       - name: listen-metrics-urls
         value: http://127.0.0.1:2381,http://192.168.64.55:2381
 imageRepository: registry.k8s.io
-kubernetesVersion: v1.34.12
+kubernetesVersion: v1.35.10
 networking:
   dnsDomain: cluster.local
   podSubnet: 10.244.0.0/16
