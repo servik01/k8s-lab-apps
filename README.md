@@ -23,7 +23,7 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 
 | Компонент        | Версия/примечание                                  |
 |------------------|-----------------------------------------------------|
-| Kubernetes       | v1.34.12 (через kubeadm), etcd 3.6.5                 |
+| Kubernetes       | v1.35.10 (через kubeadm), etcd 3.6.6                 |
 | Container runtime| containerd (SystemdCgroup=true)                      |
 | CNI              | Cilium 1.20.1 под управлением ArgoCD (`platform/cilium/values.yaml`), `kubeProxyReplacement=true` |
 | kube-proxy       | удалён, его роль выполняет Cilium (см. раздел «Установка Cilium») |
@@ -93,9 +93,9 @@ sudo systemctl enable containerd
 ```bash
 sudo apt install -y apt-transport-https ca-certificates curl gpg
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | \
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | \
   sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | \
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | \
   sudo tee /etc/apt/sources.list.d/kubernetes.list
 
 sudo apt update
@@ -685,6 +685,16 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 **Правило**: все изменения Cilium делаются в `platform/cilium/values.yaml` и `git push`, `cilium upgrade` не используется. CLI остаётся для `cilium status` и диагностики. Значение `k8sServiceHost: k8s-api.lab.local` работает потому, что агент и оператор в `hostNetwork` резолвят имя через `/etc/hosts` ноды.
 
 Установка на чистый кластер: сначала Cilium ставится CLI (раздел «Установка Cilium»), затем `kubectl apply -f bootstrap/cilium.yaml`. Argo «усыновит» ресурсы, различие только в метках трекинга.
+
+## Обновление Kubernetes до 1.35
+
+6 ноября 2026 обе ноды последовательно обновлены с v1.34.12 до **v1.35.10**. Пакеты `kubeadm`, `kubelet`, `kubectl` установлены как `1.35.10-1.1` из apt-репозитория `v1.35` и закреплены через `apt-mark hold`. Containerd и Cilium при этом не обновлялись.
+
+Перед обновлением сделаны свежий снимок etcd, копии `/etc/kubernetes`, конфигурации kubelet и apt в `/root/kubernetes-before-1.35-*` на каждой ноде. На control-plane в том же закрытом каталоге сохранён `postgres-all.sql` через `pg_dumpall` (содержит чувствительные данные и роли, не добавлять в Git).
+
+Порядок: новый kubeadm и `upgrade plan`; на первой control-plane — `kubeadm upgrade apply v1.35.10 --skip-phases=addon/kube-proxy --yes`; затем drain, обновление kubelet/kubectl, restart kubelet и uncordon. На worker — новый kubeadm, `kubeadm upgrade node`, drain, обновление kubelet/kubectl, restart и uncordon. Drain выполнялся с `--ignore-daemonsets --delete-emptydir-data`, с временной недоступностью приложений. После пересоздания `vault-0` выполнен unseal существующим локальным ключом.
+
+Kubeadm обновил etcd до **3.6.6-0**, CoreDNS до **v1.13.1**. Фаза kube-proxy пропущена явно, DaemonSet не создан: Service и NodePort продолжает обслуживать Cilium. `platform/kubeadm/config.yaml` актуализирован до v1.35.10; флаги метрик control-plane сохранены. После drain Hubble relay оказался на worker и не мог подключиться к `hubble-peer` (таймаут). В values Cilium его размещение закреплено на control-plane с toleration, возвращая прежнюю рабочую топологию. `vault-demo` пересоздан после готовности Vault injector, чтобы вернуть sidecar.
 
 ## Конфигурация kubeadm (метрики control-plane)
 

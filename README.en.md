@@ -23,7 +23,7 @@ The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and al
 
 | Component | Version / notes |
 |-----------|-----------------|
-| Kubernetes | v1.34.12 (kubeadm), etcd 3.6.5 |
+| Kubernetes | v1.35.10 (kubeadm), etcd 3.6.6 |
 | Container runtime | containerd (`SystemdCgroup=true`) |
 | CNI | Cilium 1.20.1 managed by ArgoCD (`platform/cilium/values.yaml`), `kubeProxyReplacement=true` |
 | kube-proxy | Removed; Cilium handles its role (see Installing Cilium) |
@@ -93,9 +93,9 @@ sudo systemctl enable containerd
 ```bash
 sudo apt install -y apt-transport-https ca-certificates curl gpg
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | \
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | \
   sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | \
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | \
   sudo tee /etc/apt/sources.list.d/kubernetes.list
 
 sudo apt update
@@ -685,6 +685,16 @@ Migration sequence that worked without pod restarts: create the Application with
 **Rule**: make all Cilium changes in `platform/cilium/values.yaml` and run `git push`; do not use `cilium upgrade`. Keep the CLI for `cilium status` and diagnostics. `k8sServiceHost: k8s-api.lab.local` works because the agent and operator use `hostNetwork` and resolve the name through the node's `/etc/hosts`.
 
 For a fresh cluster, install Cilium using the CLI first (see Installing Cilium), then run `kubectl apply -f bootstrap/cilium.yaml`. Argo adopts the resources, adding its tracking metadata.
+
+## Kubernetes upgrade to 1.35
+
+On 6 November 2026, both nodes were upgraded sequentially from v1.34.12 to **v1.35.10**. Packages `kubeadm`, `kubelet`, and `kubectl` use version `1.35.10-1.1` from the `v1.35` apt repository and are pinned with `apt-mark hold`. Containerd and Cilium were not upgraded.
+
+Preparation included a fresh etcd snapshot and backups of `/etc/kubernetes`, kubelet configuration, and the apt source in `/root/kubernetes-before-1.35-*` on each node. The same protected directory on the control-plane also holds `postgres-all.sql` from `pg_dumpall` (contains sensitive data and roles; keep it out of Git).
+
+Sequence: upgrade kubeadm and run `upgrade plan`; on the first control-plane run `kubeadm upgrade apply v1.35.10 --skip-phases=addon/kube-proxy --yes`, then drain, upgrade kubelet/kubectl, restart kubelet, and uncordon. On the worker: upgrade kubeadm, run `kubeadm upgrade node`, drain, upgrade kubelet/kubectl, restart, and uncordon. Drain used `--ignore-daemonsets --delete-emptydir-data` with temporary application downtime. After `vault-0` was recreated, it was unsealed with the existing local key.
+
+Kubeadm upgraded etcd to **3.6.6-0** and CoreDNS to **v1.13.1**. The kube-proxy phase was explicitly skipped and no DaemonSet was created: Cilium continues to handle Services and NodePort. `platform/kubeadm/config.yaml` now specifies v1.35.10; control-plane metrics flags were preserved. After drain, Hubble relay landed on the worker and timed out connecting to `hubble-peer`. Cilium values pin it to the control-plane with a toleration, restoring its previous working placement. `vault-demo` was recreated after the Vault injector became ready to restore its sidecar.
 
 ## kubeadm configuration (control-plane metrics)
 
