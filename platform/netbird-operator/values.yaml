@@ -1,0 +1,26 @@
+cluster:
+  name: k8s-lab
+  dns: svc.cluster.local
+
+netbirdAPI:
+  keyFromSecret:
+    name: netbird-mgmt-api-key
+    key: NB_API_KEY
+
+webhook:
+  enableCertManager: true
+
+operator:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+ingress:
+  enabled: false
+
+gatewayAPI:
+  enabled: false
