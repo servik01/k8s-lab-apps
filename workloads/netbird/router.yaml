@@ -1,0 +1,14 @@
+apiVersion: netbird.io/v1alpha1
+kind: NetworkRouter
+metadata:
+  name: lab
+  namespace: netbird
+spec:
+  dnsZoneRef:
+    name: k8s.lab.internal
+  workloadOverride:
+    replicas: 1
+    podTemplate:
+      spec:
+        nodeSelector:
+          kubernetes.io/hostname: k8s-worker
