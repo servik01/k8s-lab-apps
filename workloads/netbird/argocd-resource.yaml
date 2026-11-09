@@ -1,0 +1,13 @@
+apiVersion: netbird.io/v1alpha1
+kind: NetworkResource
+metadata:
+  name: argocd
+  namespace: argocd
+spec:
+  networkRouterRef:
+    name: lab
+    namespace: netbird
+  serviceRef:
+    name: argocd-server
+  groups:
+    - name: k8s-lab-admins
