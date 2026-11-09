@@ -10,5 +10,11 @@ spec:
     replicas: 1
     podTemplate:
       spec:
+        containers:
+          - name: netbird
+            env:
+              # Keep Kubernetes traffic local instead of using an Exit Node.
+              - name: NB_DISABLE_CLIENT_ROUTES
+                value: "true"
         nodeSelector:
           kubernetes.io/hostname: k8s-worker
