@@ -38,6 +38,8 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 | Тестовые приложения | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch образы под arm64) |
 | База данных | PostgreSQL `postgres:17-bookworm` (проверена 17.11, arm64), StatefulSet, PVC 2Gi на worker |
 | Service mesh | Linkerd `edge-26.11.1`, Helm-чарты `2026.11.1`, Gateway API CRD `v1.5.1`; ingress остаётся ingress-nginx |
+| Синхронизация секретов | External Secrets Operator, чарт `2.14.0`, Vault Kubernetes auth |
+| Доступ к сервисам | NetBird Cloud + Operator `0.9.0`, NetworkRouter и NetworkResource для ArgoCD |
 
 ## Подготовка ОС (все ноды)
 
@@ -268,6 +270,8 @@ k8s-lab-apps/
 ```
 
 Новые компоненты: `workloads/postgres/` (StatefulSet и Services), `workloads/mesh-demo/` (клиент и HTTP-сервер с Linkerd). Конфигурация mesh лежит в `platform/linkerd/` и `platform/linkerd-webhooks/`; отдельные Application — `bootstrap/linkerd-crds.yaml`, `bootstrap/linkerd-webhooks.yaml`, `bootstrap/linkerd.yaml`. Они применяются вручную, вне генератора `workloads/*`.
+
+NetBird описан в `workloads/netbird/`, значения оператора — в `platform/netbird-operator/values.yaml`. Отдельные Application `bootstrap/external-secrets.yaml` и `bootstrap/netbird-operator.yaml` устанавливают операторы; их bootstrap-манифесты применяются вручную.
 
 ### ApplicationSet
 
@@ -514,6 +518,63 @@ grep '^request_total' /tmp/mesh-client-proxy-metrics.txt | grep 'tls="true"'
 
 mTLS подтверждён: серверные метрики показывают `tls="true"` и `client_id`, клиентские — `tls="true"` и `server_id`. Идентичность обоих — `default.mesh-demo.serviceaccount.identity.linkerd.cluster.local`, поскольку используется общий ServiceAccount `default`. Приложения говорят по HTTP, защищено соединение между прокси. Политика пока `all-unauthenticated`: mTLS наблюдаемого трафика не означает запрета незашифрованным клиентам. Отдельные ServiceAccount и обязательная авторизация ещё не настроены.
 
+## NetBird: доступ к сервисам без port-forward
+
+ArgoCD доступен с Mac, подключённого к NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS возвращает ClusterIP `10.106.250.7`; доступ с Mac проверен ответом HTTP 200. Самоподписанный сертификат по-прежнему требует доверия в браузере. Другие сервисы пока не опубликованы через NetworkResource.
+
+### External Secrets и Vault
+
+`bootstrap/external-secrets.yaml` устанавливает External Secrets Operator (чарт `2.14.0`) в namespace `external-secrets`. Webhook-сертификат выпускает cert-manager через `ClusterIssuer/selfsigned-issuer`; встроенный cert-controller выключен. Application проверен в состоянии `Synced / Healthy`.
+
+Секреты записаны в Vault вручную, их значения не хранятся в Git. External Secrets использует Kubernetes auth с audience `vault`, отдельными ServiceAccount и ролями с доступом только на чтение соответствующего пути:
+
+| Vault KV v2 | Поле | Kubernetes Secret в `netbird` | Ключ |
+|---|---|---|---|
+| `secret/netbird` | `setup_key` | `netbird-setup-key` | `NB_SETUP_KEY` |
+| `secret/netbird-operator` | `api_key` | `netbird-mgmt-api-key` | `NB_API_KEY` |
+
+Политики и роли описаны в `iac/vault/netbird.tf` и `iac/vault/netbird-operator.tf` и применены OpenTofu. Манифесты `workloads/netbird/secrets.yaml` и `operator-secret.yaml` создают SecretStore и ExternalSecret; интервал обновления — `1h`, `creationPolicy: Orphan`, `deletionPolicy: Retain`. Оба SecretStore проверены как `Valid`, ExternalSecret — `SecretSynced`. Для обновления секретов Vault должен быть unsealed; сохранённые Kubernetes Secrets при недоступности Vault остаются на месте.
+
+### Оператор, роутер и доступ
+
+`bootstrap/netbird-operator.yaml` устанавливает OCI-чарт `ghcr.io/netbirdio/helm-charts/netbird-operator` версии `0.9.0`, значения — `platform/netbird-operator/values.yaml`. Одна реплика, webhook TLS через cert-manager; ingress и Gateway API интеграции выключены. PAT принадлежит пользователю NetBird с ролью **Admin**: с ролью Network Admin создание SetupKey завершалось `permission denied`. Оператор создаёт собственный SetupKey для роутера; синхронизированный `netbird-setup-key` текущим NetworkRouter не используется.
+
+В NetBird Cloud вручную созданы группа `k8s-lab-admins` с Mac и DNS-зона `k8s.lab.internal`. Для доступа настроена политика от группы администраторов к ресурсу ArgoCD, TCP 443. Одна только стандартная peer-политика `All ↔ All` не предоставила маршрут к этому ресурсу.
+
+- `workloads/netbird/router.yaml`: NetworkRouter `lab` в `netbird`, одна реплика на `k8s-worker`, ссылка на DNS-зону.
+- `workloads/netbird/argocd-resource.yaml`: NetworkResource `argocd` в namespace `argocd`, Service `argocd-server`, роутер `netbird/lab`, группа `k8s-lab-admins`.
+- Application `netbird` создаётся генератором `workloads/*`; манифест ресурса явно задаёт namespace `argocd`.
+
+Оператор и роутер проверены как готовые; NetworkResource — `Ready=True`. Настройки группы, DNS-зоны и политики NetBird Cloud пока не описаны в этом репозитории.
+
+### Маршруты роутера
+
+При диагностике routing peer автоматически выбрал `Exit Node (Belgrade)`. Маршруты к ClusterIP, pod IP и DNS уходили через `wt0`, поэтому запросы с Mac завершались таймаутом даже при рабочем туннеле. После `netbird networks deselect "Exit Node (Belgrade)"` маршруты вернулись на `eth0`, TCP к сервису и поду стал доступен, ArgoCD ответил 200.
+
+В `router.yaml` закреплено `NB_DISABLE_CLIENT_ROUTES: "true"` для контейнера `netbird`. Это отключает принятие клиентских маршрутов, включая Exit Node, при создании пода, сохраняя работу routing peer для сервисов Kubernetes. Коммит настройки — `ad940d9`; server dry-run прошёл. Проверку применения переменной после синхронизации и пересоздания пода нужно выполнить отдельно.
+
+На ноде кластера:
+
+```bash
+kubectl -n argocd get application netbird netbird-operator external-secrets
+kubectl -n netbird get networkrouter,secretstore,externalsecret
+kubectl -n argocd get networkresource argocd
+kubectl -n netbird exec deployment/networkrouter-lab -c netbird -- printenv NB_DISABLE_CLIENT_ROUTES
+kubectl -n netbird exec deployment/networkrouter-lab -c netbird -- ip route get 10.106.250.7
+```
+
+Ожидаются `true` и маршрут через `eth0`, а не `wt0`. На Mac:
+
+```bash
+netbird networks list
+route -n get 10.106.250.7
+curl -k -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'ArgoCD HTTP: %{http_code}\n' \
+  https://argocd-server.argocd.k8s.lab.internal
+```
+
+Ресурс должен быть выбран, маршрут — идти через интерфейс NetBird (`utun…`), ответ — HTTP 200. Флаг `-k` используется здесь для проверки доступности с самоподписанным сертификатом.
+
 ## Эксплуатация: после перезагрузки VM
 
 Ноды обслуживаются по одной. При выключении control-plane API, Vault и Prometheus недоступны, worker можно оставить включённым. После изменения RAM control-plane до 6144 MiB выполнены запуск, unseal Vault и проверка приложений. После перезапуска одного worker Vault не требует unseal, если `vault-0` не перезапускался. `/proc/swaps` проверяется на обеих нодах.
@@ -521,7 +582,7 @@ mTLS подтверждён: серверные метрики показыва�
 Kubernetes стартует сам (`containerd` и `kubelet` в автозапуске), на подъём нужно 3–5 минут. Вручную после перезагрузки:
 
 1. Распечатать Vault (команда выше), иначе `vault-demo` и все поды с injector'ом остаются не готовы.
-2. Запустить port-forward к ArgoCD, если нужен UI: `kubectl -n argocd port-forward --address 0.0.0.0 svc/argocd-server 8080:443`.
+2. Открыть ArgoCD через NetBird: `https://argocd-server.argocd.k8s.lab.internal`. Port-forward остаётся запасным способом: `kubectl -n argocd port-forward --address 0.0.0.0 svc/argocd-server 8080:443`.
 
 Проверка после загрузки:
 
