@@ -33,7 +33,7 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 | GitOps           | ArgoCD + ApplicationSet (репозиторий `k8s-lab-apps`) |
 | Хранилище        | local-path-provisioner v0.0.37 (default StorageClass `local-path`) |
 | Секреты          | Vault (чарт 0.34.0, Vault 2.0.3), Raft на PVC, 1 реплика, ручной unseal; конфигурация в `iac/vault` (OpenTofu) |
-| Мониторинг       | kube-prometheus-stack 91.9.0 (Prometheus, Grafana; Alertmanager выключен), данные на PVC |
+| Мониторинг       | kube-prometheus-stack 91.9.0 (Prometheus, Grafana, Alertmanager), данные на PVC |
 | Сеть, наблюдаемость | Hubble (relay + UI), метрики Cilium в Prometheus |
 | Тестовые приложения | `nginx-demo`, `whoami`, `rbac-demo`, `netpol-demo`, `vault-demo` (multi-arch образы под arm64) |
 | База данных | PostgreSQL `postgres:17-bookworm` (проверена 17.11, arm64), StatefulSet, PVC 2Gi на worker |
@@ -694,7 +694,7 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 
 Ключевые значения `values.yaml`:
 
-- Alertmanager выключен (экономия памяти, уведомления в лабе не нужны).
+- Alertmanager включён: одна реплика и PVC 1Gi на control-plane; внешние каналы уведомлений пока не настроены.
 - Grafana и Prometheus за ingress-nginx с TLS от `selfsigned-issuer` (`grafana.lab.local`, `prometheus.lab.local`).
 - Prometheus: 5Gi на `local-path` control-plane, retention 7 дней; toleration позволяет пересоздать под на этой ноде.
 - Grafana: 1Gi, `persistence.existingClaim: grafana-worker-data`, `nodeSelector` на `k8s-worker`, без toleration control-plane. Статические PV/PVC описаны в `workloads/monitoring/templates/grafana-worker-storage.yaml`: `storageClassName: ""`, `Retain`, local path `/opt/local-path-provisioner/grafana-worker-data`.
@@ -706,6 +706,49 @@ kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-passwor
 Доступ: на Mac в `/etc/hosts` добавить `192.168.64.55 grafana.lab.local prometheus.lab.local`, затем `https://grafana.lab.local:30971` (логин `admin`) и `https://prometheus.lab.local:30971`. Prometheus UI открыт без аутентификации, на проде его закрывают. В **Status → Targets** должны быть `UP` apiserver, kubelet (включая cadvisor), kube-state-metrics, node-exporter, coredns.
 
 Полезный запрос в Prometheus: `sum by (namespace) (container_memory_working_set_bytes{container!=""})`, потребление памяти по namespace.
+
+### Метрики приложений и Alertmanager
+
+11 ноября 2026 подключены PostgreSQL, ArgoCD и Vault. Основной datasource Grafana остаётся Prometheus. Dashboard **Lab Applications** доступен через NetBird: **http://monitoring-grafana.monitoring.k8s.lab.internal/d/lab-applications**. JSON хранится в `workloads/monitoring/dashboards/lab-applications.json`, ConfigMap с меткой `grafana_dashboard: "1"` загружается штатным sidecar Grafana.
+
+| Источник | Реализация | Проверенные данные |
+| --- | --- | --- |
+| PostgreSQL | `postgres-exporter:v0.20.1`, Deployment/Service/ServiceMonitor в `workloads/postgres/monitoring.yaml` | `pg_up=1`, подключения и транзакции по базам |
+| ArgoCD | Четыре ServiceMonitor в `workloads/monitoring/templates/argocd-servicemonitors.yaml` | Controller, server, repo-server, ApplicationSet; `argocd_app_info` для 17 Application |
+| Vault | `vault.serverTelemetry.serviceMonitor` и Raft HCL в `workloads/vault/values.yaml` | `vault_core_unsealed=1`, runtime и request metrics |
+| Alertmanager | Включён в kube-prometheus-stack | Метрики работы Alertmanager и активные алерты |
+
+Для exporter используется отдельная роль PostgreSQL `postgres_exporter`: `LOGIN` + `pg_monitor`, без superuser, создания баз/ролей, replication и bypass RLS. Пароль смонтирован из Secret `postgres-exporter-auth` как файл, не включён в Git, URI или аргументы контейнера. Права `lab_app` остаются ограниченными. Exporter размещён на control-plane с toleration, requests `10m/32Mi`, memory limit `128Mi`; сам PostgreSQL не перезапускался.
+
+Перед первым sync exporter или после установки PostgreSQL с пустым PVC создать роль и Secret из корня репозитория, в окружении с рабочим kubectl:
+
+```bash
+python3 scripts/bootstrap-postgres-monitoring.py
+```
+
+Скрипт использует административный локальный вход внутри `postgres-0`, создаёт случайный пароль без вывода, повторно использует пароль существующего Secret и выдаёт `pg_monitor`. Он не изменяет пароль `lab_app`. Роль хранится в PostgreSQL, Secret — в Kubernetes; при пересоздании Secret с новым паролем нужно повторно выполнить bootstrap и перезапустить exporter для перечитывания файла.
+
+Vault сохраняет Prometheus metrics на `60s`, `disable_hostname=true`. Внутренний `/v1/sys/metrics?format=prometheus` доступен Prometheus без токена через `listener.telemetry.unauthenticated_metrics_access=true`; другие API Vault по-прежнему требуют авторизации. Этот metrics endpoint не опубликован через ingress или NetBird. После изменения HCL нужен перезапуск `vault-0` (`OnDelete`) и unseal; перед первым применением сохранён Raft snapshot `/root/vault-before-monitoring-20261111T121621Z.snap` на control-plane.
+
+Alertmanager: одна реплика на control-plane, PVC `1Gi` на `local-path`, requests `10m/64Mi`, memory limit `256Mi`. Prometheus обнаруживает его автоматически. Datasource **Alertmanager** в Grafana теперь указывает на работающий сервис. Внешние email/Telegram/Slack-получатели не настроены: receiver `null`, алерты доступны в UI/API. Доставка Prometheus → Alertmanager проверена по штатному алерту `Watchdog` — это постоянный контрольный сигнал, а не авария приложения.
+
+В `workloads/monitoring/templates/application-alerts.yaml` заданы правила:
+
+- `LabPostgreSQLUnavailable`: `pg_up=0` в течение 2 минут.
+- `LabApplicationMetricsUnavailable`: endpoint новых метрик недоступен 5 минут.
+- `LabArgoCDApplicationUnhealthy`: health приложения вне `Healthy/Progressing` в течение 10 минут.
+- `LabVaultSealed`: `vault_core_unsealed=0` в течение минуты.
+
+Проверка в кластере:
+
+```bash
+kubectl -n postgres get deployment postgres-exporter
+kubectl -n monitoring get alertmanager,pvc,pods
+kubectl get servicemonitors -A
+kubectl -n monitoring get prometheusrule lab-applications
+```
+
+В Grafana Explore выбрать Prometheus и проверить `pg_up`, `argocd_app_info`, `vault_core_unsealed`, `alertmanager_alerts`. Новые scrape targets проверены как `UP`, правила вычисляются без ошибок. Помимо dashboard **Lab Applications**, существующие Kubernetes/Cilium dashboards продолжают работать.
 
 ### Перенос Grafana на worker
 

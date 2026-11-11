@@ -9,7 +9,7 @@
     "alertmanager"
   ],
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": false,
   "timezone": "browser",
   "refresh": "30s",
@@ -73,7 +73,7 @@
     },
     {
       "id": 2,
-      "title": "Vault metrics reachable",
+      "title": "Vault unsealed",
       "type": "stat",
       "datasource": {
         "type": "prometheus",
@@ -88,7 +88,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(up{namespace=\"vault\"}) or vector(0)",
+          "expr": "max(vault_core_unsealed{namespace=\"vault\"}) or vector(0)",
           "legendFormat": "{{job}}",
           "range": false,
           "instant": true
