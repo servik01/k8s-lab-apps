@@ -39,7 +39,7 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 | База данных | PostgreSQL `postgres:17-bookworm` (проверена 17.11, arm64), StatefulSet, PVC 2Gi на worker |
 | Service mesh | Linkerd `edge-26.11.1`, Helm-чарты `2026.11.1`, Gateway API CRD `v1.5.1`; ingress остаётся ingress-nginx |
 | Синхронизация секретов | External Secrets Operator, чарт `2.14.0`, Vault Kubernetes auth |
-| Доступ к сервисам | NetBird Cloud + Operator `0.9.0`, NetworkRouter и NetworkResource для ArgoCD и Grafana |
+| Доступ к сервисам | NetBird Cloud + Operator `0.9.0`, NetBird router: ArgoCD, Grafana и PostgreSQL; Cloud-конфигурация в приватном репозитории Netbird |
 
 ## Подготовка ОС (все ноды)
 
@@ -520,7 +520,9 @@ mTLS подтверждён: серверные метрики показыва�
 
 ## NetBird: доступ к сервисам без port-forward
 
-ArgoCD доступен с Mac, подключённого к NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS возвращает ClusterIP `10.106.250.7`; доступ с Mac проверен ответом HTTP 200. Самоподписанный сертификат по-прежнему требует доверия в браузере. Grafana также опубликована через NetworkResource; адрес и политика описаны ниже.
+ArgoCD доступен с Mac, подключённого к NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS возвращает ClusterIP `10.106.250.7`; доступ с Mac проверен ответом HTTP 200. Самоподписанный сертификат по-прежнему требует доверия в браузере. Grafana опубликована через NetworkResource, PostgreSQL — через Terraform в отдельном репозитории NetBird; адреса и политики описаны ниже.
+
+Конфигурация NetBird Cloud теперь управляется приватным репозиторием Netbird. Изменения Cloud-групп, политик, ресурсов и DNS выполнять там через Terraform plan/apply. Kubernetes router и существующие манифесты оператора остаются здесь; перед изменением совместно управляемых объектов нужно согласовать владельца полей.
 
 ### External Secrets и Vault
 
@@ -546,13 +548,13 @@ ArgoCD доступен с Mac, подключённого к NetBird Cloud: **h
 - `workloads/netbird/grafana-resource.yaml`: Group `grafana` (группа NetBird `k8s-lab-grafana`) и NetworkResource `grafana` в namespace `monitoring`, Service `monitoring-grafana`, роутер `netbird/lab`.
 - Application `netbird` создаётся генератором `workloads/*`; манифесты ресурсов явно задают namespace `argocd` или `monitoring`.
 
-Оператор и роутер проверены как готовые; NetworkResource — `Ready=True`. Настройки группы администраторов, DNS-зоны и политик NetBird Cloud пока не описаны декларативно в этом репозитории.
+Оператор и роутер проверены как готовые; NetworkResource — `Ready=True`. Настройки группы администраторов, DNS-зоны и политик NetBird Cloud описаны Terraform в приватном репозитории Netbird.
 
 ### Grafana через NetBird
 
 Адрес: **http://monitoring-grafana.monitoring.k8s.lab.internal**. DNS возвращает ClusterIP `10.103.1.3`; Service слушает TCP 80 и направляет запросы в Grafana на 3000. С Mac 11 ноября 2026 проверены маршрут через `utun100`, HTTP 302 на страницу входа и доступность приложения. Вход — обычными учётными данными Grafana.
 
-Группа назначения `k8s-lab-grafana` управляется оператором из Git. В NetBird Cloud через API создана политика `k8s-lab-grafana-admins`: источник `k8s-lab-admins`, назначение `k8s-lab-grafana`, протокол TCP, только порт 80, направление от клиента к ресурсу. Сама политика пока хранится в Cloud, не в Git: старый `NBPolicy` оператора 0.9.0 рассчитан на `NBResource` и без него пропускает создание правила. Для этой публикации используется `NetworkResource`.
+Группа назначения `k8s-lab-grafana` управляется оператором из Git. В NetBird Cloud через API создана политика `k8s-lab-grafana-admins`: источник `k8s-lab-admins`, назначение `k8s-lab-grafana`, протокол TCP, только порт 80, направление от клиента к ресурсу. Политика и остальные Cloud-объекты Grafana импортированы в Terraform приватного репозитория Netbird. Старый `NBPolicy` оператора 0.9.0 рассчитан на `NBResource` и без него пропускает создание правила; для публикации Grafana используется `NetworkResource`.
 
 Это прямой HTTP-доступ к Service внутри туннеля NetBird; TLS на этом адресе не настроен. Прежний HTTPS-доступ через ingress `https://grafana.lab.local:30971` продолжает работать.
 
@@ -565,6 +567,37 @@ curl -sS --connect-timeout 10 --max-time 20 \
 ```
 
 Ожидается HTTP 302 с перенаправлением на вход. В кластере: `kubectl -n monitoring get group.netbird.io grafana` и `kubectl -n monitoring get networkresource grafana` должны показывать `Ready=True`.
+
+### PostgreSQL через NetBird
+
+Cloud-конфигурация находится в репозитории Netbird: Terraform создаёт группу `k8s-lab-postgres`, network resource `10.98.193.66/32`, DNS A-запись и политику `k8s-lab-postgres-admins`. Только `k8s-lab-admins` получает TCP/5432 к этому ресурсу через существующий router `lab`. Отдельный Kubernetes NetworkResource для PostgreSQL не создаётся, чтобы operator не конкурировал с Terraform.
+
+| Параметр DBeaver / DataGrip / pgAdmin | Значение |
+| --- | --- |
+| Host | `postgres.postgres.k8s.lab.internal` |
+| Port | `5432` |
+| Database | `lab` |
+| User | `lab_app` |
+| Password | Ранее заданный пароль `lab_app`, не хранится в Git |
+| SSL mode | `disable` (PostgreSQL TLS выключен; с Mac используется туннель NetBird) |
+
+SSH tunnel и port-forward не требуются. Для psql, если он установлен на Mac:
+
+```bash
+psql 'host=postgres.postgres.k8s.lab.internal port=5432 dbname=lab user=lab_app sslmode=disable' -W
+```
+
+Пароль вводится интерактивно. После входа проверить `SELECT current_user, current_database();`. `lab_app` — ограниченная роль для схемы `app`; сетевой доступ не выдаёт ей дополнительных прав. Service `postgres/postgres` остаётся ClusterIP на TCP/5432 с targetPort 5432; при изменении его IP обновить Terraform-ресурс и DNS в репозитории Netbird.
+
+Проверка сети с Mac:
+
+```bash
+dscacheutil -q host -a name postgres.postgres.k8s.lab.internal
+route -n get 10.98.193.66
+nc -vz -w 5 postgres.postgres.k8s.lab.internal 5432
+```
+
+11 ноября 2026 Terraform apply в репозитории Netbird создал четыре объекта без изменения существующих. С Mac проверены DNS `10.98.193.66`, маршрут через `utun100`, TCP/5432 и SCRAM-SHA-256 запрос аутентификации для `lab_app`/`lab`. Полный SQL login требует существующего пароля и этой проверкой не выполнялся.
 
 ### Маршруты роутера
 

@@ -39,7 +39,7 @@ The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and al
 | Database | PostgreSQL `postgres:17-bookworm` (verified 17.11, arm64), StatefulSet, 2Gi PVC on worker |
 | Service mesh | Linkerd `edge-26.11.1`, Helm charts `2026.11.1`, Gateway API CRDs `v1.5.1`; ingress remains ingress-nginx |
 | Secret synchronization | External Secrets Operator, chart `2.14.0`, Vault Kubernetes auth |
-| Service access | NetBird Cloud + Operator `0.9.0`, NetworkRouter and NetworkResource for ArgoCD and Grafana |
+| Service access | NetBird Cloud + Operator `0.9.0`, NetBird router: ArgoCD, Grafana, PostgreSQL; Cloud configuration in the private Netbird repository |
 
 ## OS preparation (all nodes)
 
@@ -520,7 +520,9 @@ mTLS was confirmed: server metrics show `tls="true"` and `client_id`, while clie
 
 ## NetBird: service access without port-forward
 
-ArgoCD is available from the Mac connected to NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS resolves to ClusterIP `10.106.250.7`; access from the Mac was verified with HTTP 200. The self-signed certificate still requires browser trust. Grafana is also exposed through NetworkResource; its address and access policy are described below.
+ArgoCD is available from the Mac connected to NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS resolves to ClusterIP `10.106.250.7`; access from the Mac was verified with HTTP 200. The self-signed certificate still requires browser trust. Grafana is exposed through NetworkResource and PostgreSQL through Terraform in the separate NetBird repository; addresses and policies are described below.
+
+NetBird Cloud configuration is now managed in the private Netbird repository. Change Cloud groups, policies, resources, and DNS there through Terraform plan/apply. The Kubernetes router and existing operator manifests remain here; agree on field ownership before changing jointly managed objects.
 
 ### External Secrets and Vault
 
@@ -546,13 +548,13 @@ The `k8s-lab-admins` group containing the Mac and the `k8s.lab.internal` DNS zon
 - `workloads/netbird/grafana-resource.yaml`: Group `grafana` (NetBird group `k8s-lab-grafana`) and NetworkResource `grafana` in namespace `monitoring`, referencing Service `monitoring-grafana` and router `netbird/lab`.
 - The `netbird` Application is generated from `workloads/*`; resource manifests explicitly set namespace `argocd` or `monitoring`.
 
-The operator and router were verified ready, and the NetworkResource reported `Ready=True`. NetBird Cloud admin group, DNS zone, and access policy settings are not yet defined declaratively in this repository.
+The operator and router were verified ready, and the NetworkResource reported `Ready=True`. NetBird Cloud admin group, DNS zone, and access policies are defined in Terraform in the private Netbird repository.
 
 ### Grafana through NetBird
 
 Address: **http://monitoring-grafana.monitoring.k8s.lab.internal**. DNS resolves to ClusterIP `10.103.1.3`; the Service listens on TCP 80 and forwards requests to Grafana on port 3000. On 11 November 2026, the Mac verified the route through `utun100`, HTTP 302 to the login page, and application access. Use the existing Grafana credentials.
 
-The operator manages destination group `k8s-lab-grafana` from Git. Policy `k8s-lab-grafana-admins` was created through the NetBird Cloud API: source `k8s-lab-admins`, destination `k8s-lab-grafana`, TCP port 80 only, directed from client to resource. The policy itself currently lives in Cloud rather than Git: operator 0.9.0's legacy `NBPolicy` expects `NBResource` and skips rule creation without it. This setup uses `NetworkResource`.
+The operator manages destination group `k8s-lab-grafana` from Git. Policy `k8s-lab-grafana-admins` was created through the NetBird Cloud API: source `k8s-lab-admins`, destination `k8s-lab-grafana`, TCP port 80 only, directed from client to resource. The policy and other Grafana Cloud objects have been imported into Terraform in the private Netbird repository. Operator 0.9.0's legacy `NBPolicy` expects `NBResource` and skips rule creation without it; Grafana uses `NetworkResource`.
 
 This is direct HTTP access to the Service inside the NetBird tunnel; TLS is not configured on this address. The existing HTTPS ingress address `https://grafana.lab.local:30971` remains available.
 
@@ -565,6 +567,37 @@ curl -sS --connect-timeout 10 --max-time 20 \
 ```
 
 Expect HTTP 302 redirecting to login. In the cluster, `kubectl -n monitoring get group.netbird.io grafana` and `kubectl -n monitoring get networkresource grafana` should report `Ready=True`.
+
+### PostgreSQL through NetBird
+
+Cloud configuration lives in the Netbird repository: Terraform creates group `k8s-lab-postgres`, network resource `10.98.193.66/32`, an A record, and policy `k8s-lab-postgres-admins`. Only `k8s-lab-admins` receives TCP/5432 access through existing router `lab`. No Kubernetes NetworkResource is created for PostgreSQL, avoiding competing operator and Terraform ownership.
+
+| DBeaver / DataGrip / pgAdmin setting | Value |
+| --- | --- |
+| Host | `postgres.postgres.k8s.lab.internal` |
+| Port | `5432` |
+| Database | `lab` |
+| User | `lab_app` |
+| Password | Previously assigned `lab_app` password; not stored in Git |
+| SSL mode | `disable` (PostgreSQL TLS is off; Mac traffic uses the NetBird tunnel) |
+
+No SSH tunnel or port-forward is required. If psql is installed on the Mac:
+
+```bash
+psql 'host=postgres.postgres.k8s.lab.internal port=5432 dbname=lab user=lab_app sslmode=disable' -W
+```
+
+Enter the password interactively. After login, check `SELECT current_user, current_database();`. `lab_app` is a restricted role for schema `app`; network access does not grant additional database privileges. Service `postgres/postgres` remains a ClusterIP on TCP/5432 with targetPort 5432; if its IP changes, update the Terraform resource and DNS in the Netbird repository.
+
+Check the network from the Mac:
+
+```bash
+dscacheutil -q host -a name postgres.postgres.k8s.lab.internal
+route -n get 10.98.193.66
+nc -vz -w 5 postgres.postgres.k8s.lab.internal 5432
+```
+
+On 11 November 2026, Terraform apply in the Netbird repository created four objects without changing existing ones. The Mac verified DNS `10.98.193.66`, routing through `utun100`, TCP/5432, and a SCRAM-SHA-256 authentication challenge for `lab_app`/`lab`. Full SQL login requires the existing password and was not performed by this check.
 
 ### Router routes
 
