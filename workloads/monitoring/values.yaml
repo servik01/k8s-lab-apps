@@ -1,6 +1,28 @@
 kube-prometheus-stack:
   alertmanager:
-    enabled: false
+    enabled: true
+    alertmanagerSpec:
+      replicas: 1
+      nodeSelector:
+        kubernetes.io/hostname: kubernetes
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          memory: 256Mi
+      storage:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: local-path
+            accessModes: [ReadWriteOnce]
+            resources:
+              requests:
+                storage: 1Gi
 
   grafana:
     replicas: 1

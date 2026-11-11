@@ -1,0 +1,31 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: lab-applications
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: lab-applications
+      rules:
+        - alert: LabPostgreSQLUnavailable
+          expr: pg_up{namespace="postgres"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: PostgreSQL is not reachable by its exporter
+        - alert: LabApplicationMetricsUnavailable
+          expr: up{job=~"postgres-exporter|vault(-active)?|argocd-metrics|argocd-server-metrics|argocd-repo-server|argocd-applicationset-controller"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: An application metrics endpoint is unavailable
+        - alert: LabArgoCDApplicationUnhealthy
+          expr: argocd_app_info{health_status!~"Healthy|Progressing"} == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: An ArgoCD application has remained unhealthy for 10 minutes

@@ -1,0 +1,19 @@
+{{- range $service := list "argocd-metrics" "argocd-server-metrics" "argocd-repo-server" "argocd-applicationset-controller" }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $service }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - argocd
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $service }}
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 10s
+{{- end }}
