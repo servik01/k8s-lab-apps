@@ -570,7 +570,7 @@ curl -sS --connect-timeout 10 --max-time 20 \
 
 ### PostgreSQL через NetBird
 
-Cloud-конфигурация находится в репозитории Netbird: Terraform создаёт группу `k8s-lab-postgres`, network resource `10.98.193.66/32`, DNS A-запись и политику `k8s-lab-postgres-admins`. Только `k8s-lab-admins` получает TCP/5432 к этому ресурсу через существующий router `lab`. Отдельный Kubernetes NetworkResource для PostgreSQL не создаётся, чтобы operator не конкурировал с Terraform.
+Cloud-конфигурация находится в приватном репозитории Netbird: Terraform создаёт группу `k8s-lab-postgres`, network resource `10.98.193.66/32`, DNS A-запись и политику `k8s-lab-postgres-admins`. Только `k8s-lab-admins` получает TCP/5432 к этому ресурсу через существующий router `lab`. Отдельный Kubernetes NetworkResource для PostgreSQL не создаётся, чтобы operator не конкурировал с Terraform.
 
 | Параметр DBeaver / DataGrip / pgAdmin | Значение |
 | --- | --- |
