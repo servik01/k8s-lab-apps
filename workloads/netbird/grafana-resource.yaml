@@ -1,0 +1,21 @@
+apiVersion: netbird.io/v1alpha1
+kind: Group
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  name: k8s-lab-grafana
+---
+apiVersion: netbird.io/v1alpha1
+kind: NetworkResource
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  networkRouterRef:
+    name: lab
+    namespace: netbird
+  serviceRef:
+    name: monitoring-grafana
+  groups:
+    - name: k8s-lab-grafana
