@@ -23,7 +23,7 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 
 | Компонент        | Версия/примечание                                  |
 |------------------|-----------------------------------------------------|
-| Kubernetes       | v1.35.10 (через kubeadm), etcd 3.6.6                 |
+| Kubernetes       | v1.36.6 (через kubeadm), etcd 3.6.8                 |
 | Container runtime| containerd (SystemdCgroup=true)                      |
 | CNI              | Cilium 1.20.1 под управлением ArgoCD (`platform/cilium/values.yaml`), `kubeProxyReplacement=true` |
 | kube-proxy       | удалён, его роль выполняет Cilium (см. раздел «Установка Cilium») |
@@ -95,9 +95,9 @@ sudo systemctl enable containerd
 ```bash
 sudo apt install -y apt-transport-https ca-certificates curl gpg
 
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | \
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
   sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | \
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | \
   sudo tee /etc/apt/sources.list.d/kubernetes.list
 
 sudo apt update
@@ -551,7 +551,7 @@ ArgoCD доступен с Mac, подключённого к NetBird Cloud: **h
 
 При диагностике routing peer автоматически выбрал `Exit Node (Belgrade)`. Маршруты к ClusterIP, pod IP и DNS уходили через `wt0`, поэтому запросы с Mac завершались таймаутом даже при рабочем туннеле. После `netbird networks deselect "Exit Node (Belgrade)"` маршруты вернулись на `eth0`, TCP к сервису и поду стал доступен, ArgoCD ответил 200.
 
-В `router.yaml` закреплено `NB_DISABLE_CLIENT_ROUTES: "true"` для контейнера `netbird`. Это отключает принятие клиентских маршрутов, включая Exit Node, при создании пода, сохраняя работу routing peer для сервисов Kubernetes. Коммит настройки — `ad940d9`; server dry-run прошёл. Проверку применения переменной после синхронизации и пересоздания пода нужно выполнить отдельно.
+В `router.yaml` ConfigMap `netbird-router-config` задаёт `NB_DISABLE_CLIENT_ROUTES: "true"`; контейнер `netbird` получает настройку через `envFrom`. Это отключает принятие клиентских маршрутов, включая Exit Node, сохраняя работу routing peer для сервисов Kubernetes. Прямой override `env` в операторе 0.9.0 вызвал конфликт с `NB_SETUP_KEY.valueFrom` и не применялся. Исправление через ConfigMap — `6f14f3b`; 11 ноября после пересоздания пода подтверждены переменная `true`, маршрут через `eth0` и HTTP 200 с Mac.
 
 На ноде кластера:
 
@@ -753,6 +753,231 @@ kubectl -n kube-system get secret "$REL" -o jsonpath='{.data.release}' \
 **Правило**: все изменения Cilium делаются в `platform/cilium/values.yaml` и `git push`, `cilium upgrade` не используется. CLI остаётся для `cilium status` и диагностики. Значение `k8sServiceHost: k8s-api.lab.local` работает потому, что агент и оператор в `hostNetwork` резолвят имя через `/etc/hosts` ноды.
 
 Установка на чистый кластер: сначала Cilium ставится CLI (раздел «Установка Cilium»), затем `kubectl apply -f bootstrap/cilium.yaml`. Argo «усыновит» ресурсы, различие только в метках трекинга.
+
+## Обновление Kubernetes с 1.35 до 1.36: пошаговый процесс
+
+Инструкция для этой лаборатории: один control-plane `kubernetes` (`192.168.64.55`) и worker `k8s-worker` (`192.168.64.57`), Debian 13 ARM64, kubeadm, Cilium без kube-proxy. Цель — **v1.36.6**, пакет **`1.36.6-1.1`**. При следующем обновлении сначала выберите конкретный patch-релиз и соответствующую версию пакета; команды ниже не являются автоматическим выбором «последней» версии.
+
+Последовательность — control-plane, затем worker, по одной ноде. Основа: [процедура kubeadm 1.35 → 1.36](https://v1-36.docs.kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-upgrade/), [смена apt-репозитория](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/change-package-repository/), [drain](https://kubernetes.io/docs/tasks/administer-cluster/safely-drain-node/). Для Cilium проверяется [матрица совместимости](https://docs.cilium.io/en/stable/network/kubernetes/requirements/), для mesh — [поддерживаемые версии Linkerd](https://linkerd.io/docs/reference/k8s-versions/).
+
+### 1. Проверить исходное состояние и запланировать простой
+
+На control-plane под пользователем `k8s`:
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A -o wide
+kubectl -n argocd get applications
+kubectl get pdb -A
+kubectl get pvc -A
+kubectl -n vault exec vault-0 -- vault status
+kubeadm version -o short
+apt-cache policy kubeadm kubelet kubectl
+apt-mark showhold
+sudo -n true
+```
+
+Исходная версия обеих нод — 1.35.10; продолжать следует только при здоровом API, готовых нодах и понятной причине каждого нездорового приложения. Проверить совместимость Cilium, Linkerd, admission webhooks и используемых API с целевой версией. В этой лаборатории PDB на момент обновления нет. Если PDB блокирует drain, сначала разобраться с репликами и доступностью; не обходить его через `--disable-eviction`.
+
+Один control-plane означает краткую недоступность API при замене static pods. Drain control-plane останавливает Vault и Prometheus на локальных PV; drain worker затрагивает PostgreSQL, Grafana, ArgoCD и NetBird router. Они не смогут переехать с локальными томами на другую ноду. Работать по SSH через адреса нод, поскольку доступ через NetBird/ArgoCD во время обслуживания worker прервётся. `--delete-emptydir-data` ниже разрешает потерю временных данных `emptyDir`, но не удаляет PVC.
+
+### 2. Сделать резервные копии
+
+На **каждой ноде**, до изменения пакетов, в её SSH-сессии:
+
+```bash
+backup_dir="/root/kubernetes-before-1.36-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -m 700 "$backup_dir"
+sudo cp -a /etc/kubernetes /var/lib/kubelet/config.yaml \
+  /etc/apt/sources.list.d/kubernetes.list "$backup_dir/"
+sudo sh -c 'dpkg-query -W kubeadm kubelet kubectl > "$1/packages.txt"; apt-mark showhold > "$1/holds.txt"' sh "$backup_dir"
+printf 'Backup: %s\n' "$backup_dir"
+df -h / /var/lib/containerd
+```
+
+Дополнительно на **control-plane**, в той же сессии с переменной `backup_dir`:
+
+```bash
+sudo systemctl start etcd-snapshot.service
+sudo systemctl show etcd-snapshot.service -p Result -p ExecMainStatus
+sudo ls -lt /var/lib/etcd/snapshots | head -5
+kubectl -n kube-system get cm kubeadm-config -o yaml \
+  | sudo tee "$backup_dir/kubeadm-config.yaml" >/dev/null
+set -o pipefail
+kubectl -n postgres exec postgres-0 -- pg_dumpall -U postgres \
+  | sudo tee "$backup_dir/postgres-all.sql" >/dev/null
+sudo chmod 600 "$backup_dir/postgres-all.sql"
+```
+
+Ожидаются `Result=success`, `ExecMainStatus=0` и новый снимок; сервис сам проверяет его через `etcdutl`. Дамп PostgreSQL нужен отдельно: снимок etcd содержит объекты Kubernetes, а не данные на PVC. Сохранить доступ к существующему `~/vault-init.json` для unseal, не печатая его содержимое. Конфигурация, дамп и ключи содержат секреты: хранить вне Git; копия на той же VM не защищает от потери её диска.
+
+### 3. Установить новый kubeadm на control-plane
+
+Только на `kubernetes`:
+
+```bash
+sudo sed -i 's@core:/stable:/v1\.35/deb/@core:/stable:/v1.36/deb/@' \
+  /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+apt-cache madison kubeadm
+sudo apt-mark unhold kubeadm
+sudo apt-get install -y kubeadm=1.36.6-1.1
+sudo apt-mark hold kubeadm
+kubeadm version -o short
+sudo kubeadm upgrade plan v1.36.6
+```
+
+Меняется только канал Kubernetes в существующем apt source; уже установленный keyring сохраняется. Перед установкой убедиться, что `1.36.6-1.1` есть в выводе apt. На этом этапе kubelet и API ещё старые. `upgrade plan` проверяет кластер и показывает изменения компонентов; при ошибке остановиться, а не добавлять `--ignore-preflight-errors`.
+
+### 4. Обновить control-plane
+
+```bash
+sudo kubeadm upgrade apply v1.36.6 --skip-phases=addon/kube-proxy --yes
+kubectl get --raw='/readyz?verbose'
+kubectl -n kube-system get pods -o wide
+kubectl -n kube-system get ds kube-proxy --ignore-not-found
+```
+
+Kubeadm использует ConfigMap `kubeadm-config`, обновляет static pods, etcd, CoreDNS и конфигурацию kubelet. Флаги метрик controller-manager/scheduler и etcd должны сохраниться. `--skip-phases=addon/kube-proxy` обязателен для этой установки: Service/NodePort обслуживает Cilium. Предупреждение об отсутствующем ConfigMap kube-proxy ожидаемо; DaemonSet kube-proxy после операции появиться не должен. Дождаться здорового API перед следующим шагом.
+
+### 5. Обновить kubelet и kubectl на control-plane
+
+```bash
+kubectl drain kubernetes --ignore-daemonsets --delete-emptydir-data --timeout=300s
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=1.36.6-1.1 kubectl=1.36.6-1.1
+sudo apt-mark hold kubelet kubectl
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+kubectl uncordon kubernetes
+kubectl wait --for=condition=Ready node/kubernetes --timeout=180s
+kubectl get nodes -o wide
+```
+
+Drain делает ноду недоступной для новых назначений и эвакуирует обычные поды; DaemonSet и static pods остаются. Замены подов на локальных томах могут ждать `uncordon`. После обновления kubelet нужен restart; `uncordon` возвращает планирование, а `Ready` ноды ещё не означает готовность всех приложений.
+
+### 6. Восстановить Vault и проверить control-plane перед worker
+
+```bash
+kubectl -n vault wait --for=jsonpath='{.status.phase}'=Running pod/vault-0 --timeout=180s
+(
+  set -euo pipefail
+  set +x
+  jq -er '.unseal_keys_b64[0]' "$HOME/vault-init.json" \
+    | kubectl -n vault exec -i vault-0 -- sh -ec 'IFS= read -r key; vault operator unseal "$key" >/dev/null'
+)
+kubectl -n vault exec vault-0 -- vault status
+kubectl -n vault wait --for=condition=Ready pod/vault-0 --timeout=180s
+kubectl -n linkerd get pods
+kubectl -n kube-system get pods
+kubectl top nodes
+```
+
+Команда unseal рассчитана на существующую лабораторную схему Shamir **1 share / threshold 1** и локальный файл инициализации. Она не выводит ключ. Не выполнять `vault operator init` повторно. Перед worker проверить готовность Vault, Linkerd, CoreDNS, Hubble relay и metrics-server. Если metrics-server сменил размещение и `top` не работает, применить сохранённый патч (из корня репозитория):
+
+```bash
+kubectl -n kube-system patch deployment metrics-server --type=strategic \
+  --patch-file platform/metrics-server/placement-patch.yaml
+```
+
+### 7. Подготовить worker
+
+В SSH-сессии **`k8s@192.168.64.57`** выполнить смену репозитория и установку kubeadm из шага 3, но вместо `upgrade plan/apply` запустить:
+
+```bash
+sudo sed -i 's@core:/stable:/v1\.35/deb/@core:/stable:/v1.36/deb/@' \
+  /etc/apt/sources.list.d/kubernetes.list
+sudo apt-get update
+apt-cache madison kubeadm
+sudo apt-mark unhold kubeadm
+sudo apt-get install -y kubeadm=1.36.6-1.1
+sudo apt-mark hold kubeadm
+kubeadm version -o short
+sudo kubeadm upgrade node
+```
+
+На worker `upgrade apply` не используется: control-plane уже обновлён, `upgrade node` подготавливает локальную конфигурацию kubelet. Worker kubelet пока остаётся 1.35.10. При ошибке не переходить к установке нового kubelet.
+
+### 8. Drain worker, обновление пакетов и возврат нагрузки
+
+С **control-plane**:
+
+```bash
+kubectl drain k8s-worker --ignore-daemonsets --delete-emptydir-data --timeout=300s
+```
+
+На **worker**:
+
+```bash
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=1.36.6-1.1 kubectl=1.36.6-1.1
+sudo apt-mark hold kubelet kubectl
+sudo systemctl daemon-reload
+sudo systemctl restart kubelet
+```
+
+С **control-plane**:
+
+```bash
+kubectl uncordon k8s-worker
+kubectl wait --for=condition=Ready node/k8s-worker --timeout=180s
+kubectl get pods -A -o wide
+```
+
+Дождаться приложений, а не только завершения drain. Для PostgreSQL проверить готовность `postgres-0` и сохранность данных, для Grafana — существующий PVC, для ArgoCD — сервер и контроллеры. Если Vault injector или другие webhooks ещё не готовы, сначала восстановить их и только затем пересоздавать зависимые поды.
+
+### 9. Проверить результат и обновить Git
+
+На control-plane:
+
+```bash
+kubectl get nodes -o wide
+kubectl -n argocd get applications
+kubectl get pods -A
+kubectl get deployments,statefulsets -A
+kubectl top nodes
+kubectl -n netbird get networkrouter,secretstore,externalsecret
+kubectl -n argocd get networkresource argocd
+kubectl -n postgres exec postgres-0 -- pg_isready -U postgres
+"$HOME/.linkerd2/bin/linkerd" check
+"$HOME/.linkerd2/bin/linkerd" check --proxy --namespace mesh-demo
+for pod in $(kubectl -n kube-system get pods -l k8s-app=cilium -o name); do
+  kubectl -n kube-system exec "$pod" -- cilium-health status --probe
+  kubectl -n kube-system exec "$pod" -- cilium-dbg status
+done
+sudo systemctl start etcd-snapshot.service
+sudo systemctl show etcd-snapshot.service -p Result -p ExecMainStatus
+```
+
+На **каждой ноде** проверить `dpkg-query -W kubeadm kubelet kubectl`, `apt-mark showhold` и `systemctl is-active kubelet`: версии должны быть `1.36.6-1.1`, все три пакета — hold. На Mac проверить ArgoCD через NetBird:
+
+```bash
+curl -k -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'ArgoCD HTTP: %{http_code}\n' \
+  https://argocd-server.argocd.k8s.lab.internal
+```
+
+Критерии завершения: обе ноды `Ready` на v1.36.6, приложения `Synced / Healthy`, все ожидаемые контейнеры готовы, Cilium видит обе ноды и health endpoints, Linkerd check успешен, NetBird и ESO готовы, данные PostgreSQL/Grafana сохранились. Проверить метрики mTLS из раздела Linkerd и HTTP ingress nginx/whoami. Обновить `kubernetesVersion` в `platform/kubeadm/config.yaml` и текущую версию/apt-канал в обоих README; сделать Conventional Commit. Исторические записи о предыдущих обновлениях не заменять.
+
+Если apt/dpkg сообщает о занятой блокировке, дождаться завершения владеющего процесса. Lock-файлы не удалять. После освобождения проверить `sudo dpkg --audit` и `dpkg-query -W kubeadm kubelet kubectl`, затем выполнить оставшиеся `apt-mark hold`, restart и uncordon. Успешная распаковка пакетов и успешное закрепление hold — отдельные проверки.
+
+### Если шаг завершился ошибкой
+
+Не обслуживать вторую ноду, пока первая не восстановлена. Сохранить вывод ошибки, проверить `journalctl -u kubelet -n 100 --no-pager`, pod events и API health. Не запускать `kubeadm reset` и не подменять `/var/lib/etcd` при работающем etcd. Резервные manifests kubeadm лежат в `/etc/kubernetes/tmp`; обычный downgrade пакетов не является откатом состояния etcd. Восстановление из снимка — отдельная аварийная процедура с остановкой компонентов и проверкой версий. Если ошибка была до смены control-plane, состояние пакетов и apt source можно сверить с созданной копией; не восстанавливать их вслепую после успешного обновления API.
+
+### Результат обновления 11 ноября 2026
+
+Обе ноды обновлены **1.35.10 → 1.36.6**, все три пакета на каждой ноде — `1.36.6-1.1` и hold. Etcd — `3.6.8-0`, CoreDNS — `v1.14.2`; kube-proxy не установлен. Containerd, Cilium 1.20.1 и Linkerd edge-26.11.1 не обновлялись. Флаги метрик в `kubeadm-config` сохранились.
+
+Резервные каталоги: control-plane — `/root/kubernetes-before-1.36-20261111T094133Z`, worker — `/root/kubernetes-before-1.36-20261111T094138Z`. До обновления выполнены снимок etcd и дамп PostgreSQL; после обновления новый снимок также успешно создан и проверен сервисом.
+
+При выполнении возникли три эксплуатационных момента:
+
+- Краткая apt-блокировка после установки пакетов control-plane: владеющий процесс завершился, hold повторён; `dpkg --audit` не показал проблем.
+- Пока NetBird webhook запускался после drain worker, создание некоторых подов отклонялось с `FailedCreate`. После готовности webhook PostgreSQL восстановился; для `vault-demo` и `netpol-demo/client` выполнен `rollout restart`, оба deployment восстановились. Это показывает, почему нужно проверять число реплик deployment/StatefulSet, а не только готовность уже существующих подов.
+- Пересоздание NetBird router обнаружило неприменённый override `env`: оператор конфликтовал с ссылкой на setup key, а роутер снова выбирал Exit Node. Настройка переведена на ConfigMap/`envFrom`, применена через ArgoCD и проверена в новом поде; ручной deselect больше не нужен.
+
+Финальные проверки: обе ноды Ready, 17 Application Synced/Healthy, ожидаемые поды и контроллеры готовы; Cilium host/endpoint health 2/2 с обеих нод, Linkerd proxy check успешен и метрики показывают `tls="true"`. Vault unsealed, ESO SecretStore Valid и ExternalSecret SecretSynced, NetBird router/resource Ready. Запись `public.persistence_check` и ограничения `lab_app` сохранились; nginx/whoami вернули 200, Grafana — 302, ArgoCD с Mac через NetBird — 200.
 
 ## Обновление Kubernetes до 1.35
 
