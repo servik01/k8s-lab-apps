@@ -39,7 +39,7 @@ ArgoCD и Grafana перенесены на worker для разгрузки con
 | База данных | PostgreSQL `postgres:17-bookworm` (проверена 17.11, arm64), StatefulSet, PVC 2Gi на worker |
 | Service mesh | Linkerd `edge-26.11.1`, Helm-чарты `2026.11.1`, Gateway API CRD `v1.5.1`; ingress остаётся ingress-nginx |
 | Синхронизация секретов | External Secrets Operator, чарт `2.14.0`, Vault Kubernetes auth |
-| Доступ к сервисам | NetBird Cloud + Operator `0.9.0`, NetworkRouter и NetworkResource для ArgoCD |
+| Доступ к сервисам | NetBird Cloud + Operator `0.9.0`, NetworkRouter и NetworkResource для ArgoCD и Grafana |
 
 ## Подготовка ОС (все ноды)
 
@@ -520,7 +520,7 @@ mTLS подтверждён: серверные метрики показыва�
 
 ## NetBird: доступ к сервисам без port-forward
 
-ArgoCD доступен с Mac, подключённого к NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS возвращает ClusterIP `10.106.250.7`; доступ с Mac проверен ответом HTTP 200. Самоподписанный сертификат по-прежнему требует доверия в браузере. Другие сервисы пока не опубликованы через NetworkResource.
+ArgoCD доступен с Mac, подключённого к NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS возвращает ClusterIP `10.106.250.7`; доступ с Mac проверен ответом HTTP 200. Самоподписанный сертификат по-прежнему требует доверия в браузере. Grafana также опубликована через NetworkResource; адрес и политика описаны ниже.
 
 ### External Secrets и Vault
 
@@ -539,13 +539,32 @@ ArgoCD доступен с Mac, подключённого к NetBird Cloud: **h
 
 `bootstrap/netbird-operator.yaml` устанавливает OCI-чарт `ghcr.io/netbirdio/helm-charts/netbird-operator` версии `0.9.0`, значения — `platform/netbird-operator/values.yaml`. Одна реплика, webhook TLS через cert-manager; ingress и Gateway API интеграции выключены. PAT принадлежит пользователю NetBird с ролью **Admin**: с ролью Network Admin создание SetupKey завершалось `permission denied`. Оператор создаёт собственный SetupKey для роутера; синхронизированный `netbird-setup-key` текущим NetworkRouter не используется.
 
-В NetBird Cloud вручную созданы группа `k8s-lab-admins` с Mac и DNS-зона `k8s.lab.internal`. Для доступа настроена политика от группы администраторов к ресурсу ArgoCD, TCP 443. Одна только стандартная peer-политика `All ↔ All` не предоставила маршрут к этому ресурсу.
+В NetBird Cloud вручную созданы группа `k8s-lab-admins` с Mac и DNS-зона `k8s.lab.internal`. Для доступа настроена политика от группы администраторов к ресурсу ArgoCD. Одна только стандартная peer-политика `All ↔ All` не предоставила маршрут к этому ресурсу.
 
 - `workloads/netbird/router.yaml`: NetworkRouter `lab` в `netbird`, одна реплика на `k8s-worker`, ссылка на DNS-зону.
 - `workloads/netbird/argocd-resource.yaml`: NetworkResource `argocd` в namespace `argocd`, Service `argocd-server`, роутер `netbird/lab`, группа `k8s-lab-admins`.
-- Application `netbird` создаётся генератором `workloads/*`; манифест ресурса явно задаёт namespace `argocd`.
+- `workloads/netbird/grafana-resource.yaml`: Group `grafana` (группа NetBird `k8s-lab-grafana`) и NetworkResource `grafana` в namespace `monitoring`, Service `monitoring-grafana`, роутер `netbird/lab`.
+- Application `netbird` создаётся генератором `workloads/*`; манифесты ресурсов явно задают namespace `argocd` или `monitoring`.
 
-Оператор и роутер проверены как готовые; NetworkResource — `Ready=True`. Настройки группы, DNS-зоны и политики NetBird Cloud пока не описаны в этом репозитории.
+Оператор и роутер проверены как готовые; NetworkResource — `Ready=True`. Настройки группы администраторов, DNS-зоны и политик NetBird Cloud пока не описаны декларативно в этом репозитории.
+
+### Grafana через NetBird
+
+Адрес: **http://monitoring-grafana.monitoring.k8s.lab.internal**. DNS возвращает ClusterIP `10.103.1.3`; Service слушает TCP 80 и направляет запросы в Grafana на 3000. С Mac 11 ноября 2026 проверены маршрут через `utun100`, HTTP 302 на страницу входа и доступность приложения. Вход — обычными учётными данными Grafana.
+
+Группа назначения `k8s-lab-grafana` управляется оператором из Git. В NetBird Cloud через API создана политика `k8s-lab-grafana-admins`: источник `k8s-lab-admins`, назначение `k8s-lab-grafana`, протокол TCP, только порт 80, направление от клиента к ресурсу. Сама политика пока хранится в Cloud, не в Git: старый `NBPolicy` оператора 0.9.0 рассчитан на `NBResource` и без него пропускает создание правила. Для этой публикации используется `NetworkResource`.
+
+Это прямой HTTP-доступ к Service внутри туннеля NetBird; TLS на этом адресе не настроен. Прежний HTTPS-доступ через ingress `https://grafana.lab.local:30971` продолжает работать.
+
+Проверка на Mac:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'Grafana HTTP: %{http_code}\n' \
+  http://monitoring-grafana.monitoring.k8s.lab.internal
+```
+
+Ожидается HTTP 302 с перенаправлением на вход. В кластере: `kubectl -n monitoring get group.netbird.io grafana` и `kubectl -n monitoring get networkresource grafana` должны показывать `Ready=True`.
 
 ### Маршруты роутера
 

@@ -39,7 +39,7 @@ The worker firewall (`ufw`, `default deny incoming`) allows only SSH (22) and al
 | Database | PostgreSQL `postgres:17-bookworm` (verified 17.11, arm64), StatefulSet, 2Gi PVC on worker |
 | Service mesh | Linkerd `edge-26.11.1`, Helm charts `2026.11.1`, Gateway API CRDs `v1.5.1`; ingress remains ingress-nginx |
 | Secret synchronization | External Secrets Operator, chart `2.14.0`, Vault Kubernetes auth |
-| Service access | NetBird Cloud + Operator `0.9.0`, NetworkRouter and NetworkResource for ArgoCD |
+| Service access | NetBird Cloud + Operator `0.9.0`, NetworkRouter and NetworkResource for ArgoCD and Grafana |
 
 ## OS preparation (all nodes)
 
@@ -520,7 +520,7 @@ mTLS was confirmed: server metrics show `tls="true"` and `client_id`, while clie
 
 ## NetBird: service access without port-forward
 
-ArgoCD is available from the Mac connected to NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS resolves to ClusterIP `10.106.250.7`; access from the Mac was verified with HTTP 200. The self-signed certificate still requires browser trust. Other services have not yet been exposed through NetworkResource.
+ArgoCD is available from the Mac connected to NetBird Cloud: **https://argocd-server.argocd.k8s.lab.internal**. DNS resolves to ClusterIP `10.106.250.7`; access from the Mac was verified with HTTP 200. The self-signed certificate still requires browser trust. Grafana is also exposed through NetworkResource; its address and access policy are described below.
 
 ### External Secrets and Vault
 
@@ -539,13 +539,32 @@ Policies and roles are defined in `iac/vault/netbird.tf` and `iac/vault/netbird-
 
 `bootstrap/netbird-operator.yaml` installs OCI chart `ghcr.io/netbirdio/helm-charts/netbird-operator` version `0.9.0`, using `platform/netbird-operator/values.yaml`. It runs one replica with cert-manager webhook TLS; ingress and Gateway API integrations are disabled. The PAT belongs to a NetBird user with the **Admin** role: SetupKey creation failed with `permission denied` under Network Admin. The operator creates its own SetupKey for the router; the synced `netbird-setup-key` is not consumed by the current NetworkRouter.
 
-The `k8s-lab-admins` group containing the Mac and the `k8s.lab.internal` DNS zone were created manually in NetBird Cloud. An access policy grants the admin group TCP 443 access to the ArgoCD resource. The default `All ↔ All` peer policy alone did not provide a route to this resource.
+The `k8s-lab-admins` group containing the Mac and the `k8s.lab.internal` DNS zone were created manually in NetBird Cloud. An access policy grants the admin group access to the ArgoCD resource. The default `All ↔ All` peer policy alone did not provide a route to this resource.
 
 - `workloads/netbird/router.yaml`: NetworkRouter `lab` in `netbird`, one replica on `k8s-worker`, referencing the DNS zone.
 - `workloads/netbird/argocd-resource.yaml`: NetworkResource `argocd` in namespace `argocd`, referencing Service `argocd-server`, router `netbird/lab`, and group `k8s-lab-admins`.
-- The `netbird` Application is generated from `workloads/*`; the resource manifest explicitly sets namespace `argocd`.
+- `workloads/netbird/grafana-resource.yaml`: Group `grafana` (NetBird group `k8s-lab-grafana`) and NetworkResource `grafana` in namespace `monitoring`, referencing Service `monitoring-grafana` and router `netbird/lab`.
+- The `netbird` Application is generated from `workloads/*`; resource manifests explicitly set namespace `argocd` or `monitoring`.
 
-The operator and router were verified ready, and the NetworkResource reported `Ready=True`. NetBird Cloud group, DNS zone, and access policy settings are not yet defined in this repository.
+The operator and router were verified ready, and the NetworkResource reported `Ready=True`. NetBird Cloud admin group, DNS zone, and access policy settings are not yet defined declaratively in this repository.
+
+### Grafana through NetBird
+
+Address: **http://monitoring-grafana.monitoring.k8s.lab.internal**. DNS resolves to ClusterIP `10.103.1.3`; the Service listens on TCP 80 and forwards requests to Grafana on port 3000. On 11 November 2026, the Mac verified the route through `utun100`, HTTP 302 to the login page, and application access. Use the existing Grafana credentials.
+
+The operator manages destination group `k8s-lab-grafana` from Git. Policy `k8s-lab-grafana-admins` was created through the NetBird Cloud API: source `k8s-lab-admins`, destination `k8s-lab-grafana`, TCP port 80 only, directed from client to resource. The policy itself currently lives in Cloud rather than Git: operator 0.9.0's legacy `NBPolicy` expects `NBResource` and skips rule creation without it. This setup uses `NetworkResource`.
+
+This is direct HTTP access to the Service inside the NetBird tunnel; TLS is not configured on this address. The existing HTTPS ingress address `https://grafana.lab.local:30971` remains available.
+
+Check from the Mac:
+
+```bash
+curl -sS --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w 'Grafana HTTP: %{http_code}\n' \
+  http://monitoring-grafana.monitoring.k8s.lab.internal
+```
+
+Expect HTTP 302 redirecting to login. In the cluster, `kubectl -n monitoring get group.netbird.io grafana` and `kubectl -n monitoring get networkresource grafana` should report `Ready=True`.
 
 ### Router routes
 
